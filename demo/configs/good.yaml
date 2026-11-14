@@ -1,0 +1,5 @@
+lr: 0.001
+batch_size: 64
+steps: 5000
+log_every: 10
+checkpoint_every: 200

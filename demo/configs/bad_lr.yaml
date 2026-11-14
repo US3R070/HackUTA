@@ -1,0 +1,5 @@
+lr: 5.0        # deliberately too high -> NaN ~2 min in (tune)
+batch_size: 64
+steps: 5000
+log_every: 10
+checkpoint_every: 200

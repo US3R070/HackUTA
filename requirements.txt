@@ -1,0 +1,15 @@
+pydantic>=2
+pyyaml
+google-genai
+xai-sdk
+fastapi
+uvicorn
+livekit-api
+livekit-agents
+livekit-plugins-google
+livekit-plugins-elevenlabs
+mss
+numpy
+matplotlib
+torch
+pytest

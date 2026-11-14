@@ -1,0 +1,8 @@
+runs_dir: runs
+log_tail_lines: 200
+detectors:
+  plateau_window_steps: 500
+  plateau_min_improvement: 0.01
+severity:
+  high: [crash, oom, nan]
+  low: [plateau, overfit]
