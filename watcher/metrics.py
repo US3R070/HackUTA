@@ -1,51 +1,52 @@
-"""Incremental JSONL reading, including lines split across file writes."""
+"""Read runs/<run_id>/metrics.jsonl. Owner: Binoy."""
+from __future__ import annotations
+
 import json
 from pathlib import Path
+from typing import Any
 
+
+def read_metrics(path: str | Path, last_n: int | None = None) -> list[dict[str, Any]]:
+    """Return parsed metric rows; skips blank/partial lines (file may be mid-write)."""
+    p = Path(path)
+    if not p.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))  # json accepts NaN / Infinity
+        except json.JSONDecodeError:
+            continue
+    return rows[-last_n:] if last_n else rows
 
 
 class MetricsTail:
-    def __init__(self, path, start_at_end=False):
+    """Incrementally read new rows from a growing metrics.jsonl."""
+
+    def __init__(self, path: str | Path):
         self.path = Path(path)
-        self.offset = self.path.stat().st_size if start_at_end and self.path.exists() else 0
-        self.identity = self._identity() if self.path.exists() else None
-        self.pending = b''
-        self.errors = []
+        self._pos = 0
+        self._buf = ""
 
-
-    def _identity(self):
-        stat = self.path.stat()
-        return stat.st_dev, stat.st_ino
-
-
-    def read(self):
-        self.errors = []
-        try:
-            with self.path.open('rb') as stream:
-                stat = self.path.stat()
-                identity = (stat.st_dev, stat.st_ino)
-                if identity != self.identity or stat.st_size < self.offset:
-                    self.offset = 0
-                    self.pending = b''
-                self.identity = identity
-                stream.seek(self.offset)
-                chunk = stream.read()
-                self.offset = stream.tell()
-        except FileNotFoundError:
+    def new_rows(self) -> list[dict[str, Any]]:
+        if not self.path.exists():
             return []
-        
-        lines = (self.pending + chunk).split(b'\n')
-        self.pending = lines.pop()  # Hold incomplete last line until next poll.
-        rows = []
-
+        with self.path.open() as f:
+            f.seek(self._pos)
+            chunk = f.read()
+            self._pos = f.tell()
+        self._buf += chunk
+        *lines, self._buf = self._buf.split("\n")
+        out = []
         for line in lines:
-            if not line.strip():
+            line = line.strip()
+            if not line:
                 continue
             try:
-                row = json.loads(line)
-                if not isinstance(row, dict):
-                    raise ValueError('Metric must be a JSON object')
-                rows.append(row)
-            except (ValueError, UnicodeDecodeError) as exc:
-                self.errors.append(str(exc))
-        return rows
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return out

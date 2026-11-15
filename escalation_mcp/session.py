@@ -1,4 +1,4 @@
-"""Orchestrates screen share, channel, and sink for one escalation."""
+
 
 from __future__ import annotations
 
@@ -8,10 +8,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from escalation_mcp.call import CallController, CallTimings
 from escalation_mcp.channel.base import Channel
 from escalation_mcp.channel.mock import MockChannel
 from escalation_mcp.config import Settings, load_settings
-from escalation_mcp.models import ActionEvent, FinalReport, HumanDecision
+from escalation_mcp.models import (
+    DEFAULT_SAFE_ACTION,
+    ActionEvent,
+    CallStateEvent,
+    EndReason,
+    FinalReport,
+    HumanDecision,
+)
 from escalation_mcp.packet import (
     append_agent_log,
     build_packet,
@@ -27,7 +35,7 @@ from escalation_mcp.screen.backends.preview import (
 from escalation_mcp.screen.capture import CaptureLoop, FrameSource, make_frame_source
 from escalation_mcp.screen.overlay import draw_overlay
 from escalation_mcp.sink.base import Sink
-from escalation_mcp.sink.http import HttpSink
+from escalation_mcp.sink.chert import ChertSink
 from escalation_mcp.sink.mock import MockSink
 from escalation_mcp.state import STATE, ActiveIncident
 
@@ -51,8 +59,6 @@ class RuntimeHandles:
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
     fake_frames: FrameSource | None = None  # injected in tests
     sharing: bool = False
-    # After a human decision is delivered, runtime auto-resets (preview killed).
-    auto_reset_on_decision: bool = True
 
 
 RUNTIME = RuntimeHandles(settings=Settings(), sink=MockSink(), channel=MockChannel())
@@ -69,7 +75,7 @@ def configure_runtime(
     global RUNTIME
     s = settings or load_settings(require_live=False)
     if sink is None:
-        sink = HttpSink(s) if s.mode == "live" else MockSink()
+        sink = ChertSink(s) if s.mode == "live" else MockSink()
     if channel is None:
         channel = MockChannel()
     RUNTIME = RuntimeHandles(
@@ -91,7 +97,41 @@ def _overlay_fn(img):
         severity=incident.severity,
         actions=incident.overlay_actions,
         stop_from=incident.stop_banner_from,
+        call_line=_call_line(incident),
     )
+
+
+_PHASE_LABEL = {
+    "waiting_answer": "CALLING",
+    "live": "LIVE",
+    "watching": "WATCHING",
+    "agent_done": "DONE \u2713",
+    "ended": "CALL ENDED",
+}
+
+
+def _fmt_secs(secs: float | None) -> str:
+    if secs is None:
+        return ""
+    total = int(round(secs))
+    return f"{total // 60}:{total % 60:02d}"
+
+
+def _call_line(incident: ActiveIncident) -> str | None:
+    call = incident.call
+    if call is None:
+        return None
+    parts = [_PHASE_LABEL.get(call.phase, call.phase.upper())]
+    if call.phase == "waiting_answer" and call.attempt > 1:
+        parts[0] += f" (try {call.attempt})"
+    d = incident.last_decision
+    if d is not None:
+        said = d.decision if d.decision != "instruction" else f'"{(d.text or "")[:40]}"'
+        parts.append(f"You: {said}")
+    remaining = call.ends_in_s()
+    if remaining is not None and call.phase != "waiting_answer":
+        parts.append(f"auto-hangup {_fmt_secs(remaining)}")
+    return " \u00b7 ".join(parts)
 
 
 async def _setup_logging(incident_id: str) -> None:
@@ -171,6 +211,9 @@ async def reset_runtime(
     active = await STATE.get_active()
     iid = incident_id or (active.incident_id if active else None)
 
+    if active and active.call is not None:
+        await active.call.cancel()
+
     if save_report and active and iid == active.incident_id:
         report = FinalReport(
             outcome=outcome,  # type: ignore[arg-type]
@@ -214,27 +257,63 @@ async def reset_runtime(
 
 
 async def poll_human_response(incident_id: str, wait_seconds: int = 0) -> dict[str, Any]:
-    """get_human_response + auto-reset preview/state when a real decision arrives."""
-    result = await STATE.get_human_response(incident_id, wait_seconds)
-    if result.get("decision") == "none":
-        return result
+    """get_human_response. Decisions no longer tear the call down: the monitor stays
+    live until the human hangs up, leaves, or the idle timer fires."""
+    return await STATE.get_human_response(incident_id, wait_seconds)
 
-    if RUNTIME.auto_reset_on_decision:
-        outcome = {
-            "approve": "resolved",
-            "reject": "aborted",
-            "stop": "aborted",
-            "instruction": "handed_off",
-        }.get(str(result["decision"]), "aborted")
-        reset = await reset_runtime(
-            incident_id=incident_id,
-            reason=f"human_decision:{result['decision']}",
+
+def _call_timings() -> CallTimings:
+    st = RUNTIME.settings
+    return CallTimings(
+        no_answer_s=st.call_no_answer_s,
+        idle_s=st.call_idle_timeout_s,
+        done_grace_s=st.call_done_grace_s,
+        leave_grace_s=st.call_leave_grace_s,
+        max_attempts=max(1, st.call_max_attempts),
+    )
+
+
+async def _publish_call_state(incident: ActiveIncident, call: CallController) -> None:
+    event = CallStateEvent(
+        incident_id=incident.incident_id,
+        ts=_utc_now_iso(),
+        state=call.phase,
+        reason=call.end_reason,
+        attempt=call.attempt,
+        ends_in_s=call.ends_in_s(),
+        default_action=incident.default_action,
+    )
+    try:
+        await RUNTIME.channel.publish_raw("agent_events", event.model_dump())
+    except Exception:  # noqa: BLE001
+        logger.exception("call_state publish failed")
+    append_agent_log(
+        incident.incident_id,
+        {"ts": event.ts, "call_state": call.phase, "reason": call.end_reason,
+         "attempt": call.attempt},
+    )
+
+
+async def _on_call_end(incident: ActiveIncident, reason: EndReason) -> None:
+    """Phone side is over. Hang up, drop media; keep the incident for polling
+    unless the agent already finished (then finalize everything)."""
+    warnings = await RUNTIME.sink.end_call(incident.incident_id)
+    incident.warnings.extend(warnings)
+    if incident.agent_outcome is not None:
+        outcome, summary = incident.agent_outcome
+        await reset_runtime(
+            incident_id=incident.incident_id,
+            reason=f"call_ended:{reason}",
             save_report=True,
             outcome=outcome,
-            summary=f"human {result['decision']}: {result.get('text')}",
+            summary=summary,
         )
-        result = {**result, "reset": True, "preview_stopped": True, "reset_info": reset}
-    return result
+        return
+    try:
+        await RUNTIME.channel.stop()
+    except Exception:  # noqa: BLE001
+        logger.exception("channel stop failed after call end")
+    await _teardown_media()
 
 
 async def start_escalation(
@@ -248,8 +327,19 @@ async def start_escalation(
     run_id: str | None = None,
     share: str = "screen",
     incident_id: str | None = None,
+    default_action: str | None = None,
 ) -> dict[str, Any]:
     existing = await STATE.get_active()
+    if existing and existing.call is not None and existing.call.ended:
+        # Previous call is over (agent never called end_escalation): close it out.
+        await reset_runtime(
+            incident_id=existing.incident_id,
+            reason="superseded_after_call_end",
+            save_report=True,
+            outcome="handed_off",
+            summary="call ended; superseded by a new escalation",
+        )
+        existing = None
     capture_alive = bool(
         RUNTIME.capture
         and RUNTIME.capture_task
@@ -383,6 +473,7 @@ async def start_escalation(
         room=room,
         preview_url=preview_url,
     )
+    packet.default_action = (default_action or "").strip() or DEFAULT_SAFE_ACTION
     save_packet(packet)
 
     incident = ActiveIncident(
@@ -394,17 +485,50 @@ async def start_escalation(
         preview_url=preview_url,
         share=share,
         warnings=warnings,
+        default_action=packet.default_action,
     )
     await STATE.set_active(incident)
 
+    call: CallController | None = None
+    if RUNTIME.sink.places_call(packet):
+
+        async def on_state(c: CallController) -> None:
+            await _publish_call_state(incident, c)
+
+        async def on_redial(attempt: int) -> None:
+            incident.warnings.extend(await RUNTIME.sink.redial(packet, attempt))
+
+        async def on_end(reason: EndReason) -> None:
+            await _on_call_end(incident, reason)
+
+        call = CallController(
+            incident_id, _call_timings(),
+            on_state=on_state, on_redial=on_redial, on_end=on_end,
+        )
+        incident.call = call
+
     async def on_decision(decision: HumanDecision) -> None:
         await STATE.enqueue_decision(decision)
+        if call is not None:
+            await call.human_activity(decision.decision)
 
-    await channel.start(incident_id, on_decision)
+    async def on_presence(event: str) -> None:
+        if call is None:
+            return
+        if event == "joined":
+            await call.caller_joined()
+        elif event == "left":
+            await call.caller_left()
 
+    await channel.start(incident_id, on_decision, on_presence)
+
+    # Place the call first (Chert may queue it for minutes), then start the
+    # no-answer timer. If placing failed, the timer's redial is the retry.
     sink_warnings = await RUNTIME.sink.send_packet(packet)
     warnings.extend(sink_warnings)
     incident.warnings = warnings
+    if call is not None:
+        await call.start()
 
     append_agent_log(
         incident_id,
@@ -414,6 +538,7 @@ async def start_escalation(
             "title": title,
             "severity": severity,
             "share": share,
+            "default_action": packet.default_action,
         },
     )
 
@@ -423,6 +548,8 @@ async def start_escalation(
         "room": room,
         "preview_url": preview_url,
         "sink": RUNTIME.sink.name,
+        "default_action": packet.default_action,
+        "call_state": call.phase if call else None,
         "warnings": warnings,
     }
 
@@ -498,10 +625,12 @@ async def end_escalation(
     incident_id: str,
     outcome: str,
     summary: str,
+    hang_up_now: bool = False,
 ) -> dict[str, Any]:
+    """Agent is done. If the human is still on the call, keep the monitor up for a
+    short grace (CALL_DONE_GRACE_S) so they can see the result; finalize when it ends."""
     active = await STATE.get_active()
     if not active or active.incident_id != incident_id:
-        # Already auto-reset after a human decision — still free the port.
         await reset_runtime(
             incident_id=incident_id,
             reason="end_escalation_idempotent",
@@ -511,7 +640,6 @@ async def end_escalation(
 
     incident = active
 
-    # Final event
     seq = STATE.next_seq(incident)
     event = ActionEvent(
         incident_id=incident_id,
@@ -526,6 +654,27 @@ async def end_escalation(
         await RUNTIME.channel.publish_action(event)
     except Exception:  # noqa: BLE001
         logger.exception("final event publish failed")
+    append_agent_log(
+        incident_id,
+        {"ts": _utc_now_iso(), "tool": "end_escalation", "outcome": outcome,
+         "hang_up_now": hang_up_now},
+    )
+
+    call = incident.call
+    if call is not None and not call.ended:
+        incident.agent_outcome = (outcome, summary)
+        if hang_up_now:
+            await call.end("agent_done")
+        else:
+            await call.agent_done()
+        if not call.ended:
+            return {
+                "ok": True,
+                "call_state": call.phase,
+                "hangs_up_in_s": call.ends_in_s(),
+                "note": "human can keep watching; escalation finalizes when the call ends",
+            }
+        return {"ok": True, "call_state": "ended", "end_reason": call.end_reason}
 
     reset = await reset_runtime(
         incident_id=incident_id,
@@ -533,9 +682,5 @@ async def end_escalation(
         save_report=True,
         outcome=outcome,
         summary=summary,
-    )
-    append_agent_log(
-        incident_id,
-        {"ts": _utc_now_iso(), "tool": "end_escalation", "outcome": outcome},
     )
     return {"ok": True, **reset}

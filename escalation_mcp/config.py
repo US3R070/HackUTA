@@ -48,6 +48,12 @@ class Settings:
     livekit_url: str = ""
     livekit_api_key: str = ""
     livekit_api_secret: str = ""
+    # Call lifecycle (see escalation_mcp/call.py)
+    call_no_answer_s: float = 60.0
+    call_idle_timeout_s: float = 120.0
+    call_done_grace_s: float = 30.0
+    call_leave_grace_s: float = 5.0
+    call_max_attempts: int = 2
 
 
 def load_settings(*, require_live: bool | None = None) -> Settings:
@@ -74,27 +80,32 @@ def load_settings(*, require_live: bool | None = None) -> Settings:
         in ("1", "true", "True", "yes"),
         screen_default=os.getenv("SCREEN_DEFAULT") or "screen",
         screen_monitor=int(os.getenv("SCREEN_MONITOR") or "1"),
-        screen_fps=float(os.getenv("SCREEN_FPS") or "5"),
+        screen_fps=float(os.getenv("SCREEN_FPS") or "10"),
         screen_max_width=int(os.getenv("SCREEN_MAX_WIDTH") or "1280"),
         preview_port=int(os.getenv("PREVIEW_PORT") or "8765"),
         livekit_url=os.getenv("LIVEKIT_URL") or "",
         livekit_api_key=os.getenv("LIVEKIT_API_KEY") or "",
         livekit_api_secret=os.getenv("LIVEKIT_API_SECRET") or "",
+        call_no_answer_s=float(os.getenv("CALL_NO_ANSWER_S") or "60"),
+        call_idle_timeout_s=float(os.getenv("CALL_IDLE_TIMEOUT_S") or "120"),
+        call_done_grace_s=float(os.getenv("CALL_DONE_GRACE_S") or "30"),
+        call_leave_grace_s=float(os.getenv("CALL_LEAVE_GRACE_S") or "5"),
+        call_max_attempts=int(os.getenv("CALL_MAX_ATTEMPTS") or "2"),
     )
 
     check_live = require_live if require_live is not None else (mode == "live")
     if check_live:
-        missing = []
-        if not settings.livekit_url:
-            missing.append("LIVEKIT_URL")
-        if not settings.livekit_api_key:
-            missing.append("LIVEKIT_API_KEY")
-        if not settings.livekit_api_secret:
-            missing.append("LIVEKIT_API_SECRET")
-        if not settings.chert_agent_url:
-            missing.append("CHERT_AGENT_URL")
-        if not settings.escalation_shared_secret:
-            missing.append("ESCALATION_SHARED_SECRET")
+        required = [
+            ("LIVEKIT_URL", settings.livekit_url),
+            ("LIVEKIT_API_KEY", settings.livekit_api_key),
+            ("LIVEKIT_API_SECRET", settings.livekit_api_secret),
+            # Chert call (chert/client.py + sink/chert.py)
+            ("CHERT_API_KEY", os.getenv("CHERT_API_KEY")),
+            ("CHERT_PROJECT_ID", os.getenv("CHERT_PROJECT_ID")),
+            ("CHERT_LINE_ID", os.getenv("CHERT_LINE_ID")),
+            ("USER_PHONE", os.getenv("USER_PHONE")),
+        ]
+        missing = [name for name, val in required if not val]
         if missing:
             raise RuntimeError(
                 "live mode requires missing env vars: " + ", ".join(missing)

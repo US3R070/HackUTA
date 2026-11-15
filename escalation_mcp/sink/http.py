@@ -68,3 +68,11 @@ class HttpSink(Sink):
             return []
         url = f"{self.settings.chert_agent_url}/escalations/{incident_id}/events"
         return await self._post_with_retries(url, event, retries=1)
+
+    async def redial(self, packet: EscalationPacket, attempt: int) -> list[str]:
+        url = f"{self.settings.chert_agent_url}/escalations/{packet.incident_id}/redial"
+        return await self._post_with_retries(url, {"attempt": attempt}, retries=1)
+
+    async def end_call(self, incident_id: str) -> list[str]:
+        url = f"{self.settings.chert_agent_url}/escalations/{incident_id}/hangup"
+        return await self._post_with_retries(url, {}, retries=1)
