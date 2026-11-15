@@ -8,13 +8,20 @@ from typing import Any, Awaitable, Callable
 from escalation_mcp.models import ActionEvent, HumanDecision
 
 DecisionHandler = Callable[[HumanDecision], Awaitable[None]]
+# "joined" | "left" for the human caller (Chert bridge participant)
+PresenceHandler = Callable[[str], Awaitable[None]]
 
 
 class Channel(ABC):
     name: str = "base"
 
     @abstractmethod
-    async def start(self, incident_id: str, on_decision: DecisionHandler) -> None:
+    async def start(
+        self,
+        incident_id: str,
+        on_decision: DecisionHandler,
+        on_presence: PresenceHandler | None = None,
+    ) -> None:
         ...
 
     @abstractmethod

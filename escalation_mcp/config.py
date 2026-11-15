@@ -48,6 +48,12 @@ class Settings:
     livekit_url: str = ""
     livekit_api_key: str = ""
     livekit_api_secret: str = ""
+    # Call lifecycle (see escalation_mcp/call.py)
+    call_no_answer_s: float = 60.0
+    call_idle_timeout_s: float = 120.0
+    call_done_grace_s: float = 30.0
+    call_leave_grace_s: float = 5.0
+    call_max_attempts: int = 2
 
 
 def load_settings(*, require_live: bool | None = None) -> Settings:
@@ -80,6 +86,11 @@ def load_settings(*, require_live: bool | None = None) -> Settings:
         livekit_url=os.getenv("LIVEKIT_URL") or "",
         livekit_api_key=os.getenv("LIVEKIT_API_KEY") or "",
         livekit_api_secret=os.getenv("LIVEKIT_API_SECRET") or "",
+        call_no_answer_s=float(os.getenv("CALL_NO_ANSWER_S") or "60"),
+        call_idle_timeout_s=float(os.getenv("CALL_IDLE_TIMEOUT_S") or "120"),
+        call_done_grace_s=float(os.getenv("CALL_DONE_GRACE_S") or "30"),
+        call_leave_grace_s=float(os.getenv("CALL_LEAVE_GRACE_S") or "5"),
+        call_max_attempts=int(os.getenv("CALL_MAX_ATTEMPTS") or "2"),
     )
 
     check_live = require_live if require_live is not None else (mode == "live")
