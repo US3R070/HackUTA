@@ -130,7 +130,7 @@ def mentor_prompt_with_context(packet: EscalationPacket) -> str:
     except OSError:
         logger.warning("mentor prompt missing at %s; using minimal prompt", _PROMPT_PATH)
         persona = (
-            "You are Mentor, a friendly ML engineer on a FaceTime call about a failed "
+            "You are Argos, a friendly ML engineer on a FaceTime call about a failed "
             "training run. Be brief and conversational. Use send_to_grok for decisions "
             "and end_call when the caller is done."
         )
@@ -149,7 +149,7 @@ def first_message_for(packet: EscalationPacket) -> str:
         else "I think I know why, and I've got a fix ready."
     )
     return (
-        f"Hey, it's Mentor. Heads up, {first[0].lower() + first[1:] if first else 'your run broke'}. "
+        f"Hey, it's Argos. Heads up, {first[0].lower() + first[1:] if first else 'your run broke'}. "
         f"{found} Want me to walk you through it, or just apply it?"
     )
 
