@@ -29,6 +29,7 @@ def place_call(destination: str, participant_token: str, agent_identity: str = "
         "livekit_url": os.environ["LIVEKIT_URL"],
         "participant_token": participant_token,
         "remote_participant_identity": agent_identity,
+        "when_busy": "queue",
     }
     req = urllib.request.Request(f"{FACETIME_BASE}/calls", data=json.dumps(body).encode(),
                                  method="POST", headers=_headers(idem=True))
@@ -37,3 +38,13 @@ def place_call(destination: str, participant_token: str, agent_identity: str = "
             return json.loads(r.read())["data"]
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"Chert {e.code}: {e.read().decode()[:500]}") from None
+
+
+def end_call(call_id: str) -> None:
+    req = urllib.request.Request(f"{FACETIME_BASE}/calls/{call_id}/end", data=b"{}", method="POST",
+                                 headers=_headers(idem=True))
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except urllib.error.HTTPError as e:
+        if e.code not in (404, 409):
+            raise RuntimeError(f"Chert {e.code}: {e.read().decode()[:300]}") from None

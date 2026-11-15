@@ -1,4 +1,4 @@
-"""Orchestrates screen share, channel, and sink for one escalation."""
+
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from escalation_mcp.screen.backends.preview import (
 from escalation_mcp.screen.capture import CaptureLoop, FrameSource, make_frame_source
 from escalation_mcp.screen.overlay import draw_overlay
 from escalation_mcp.sink.base import Sink
-from escalation_mcp.sink.http import HttpSink
+from escalation_mcp.sink.chert import ChertSink
 from escalation_mcp.sink.mock import MockSink
 from escalation_mcp.state import STATE, ActiveIncident
 
@@ -69,7 +69,7 @@ def configure_runtime(
     global RUNTIME
     s = settings or load_settings(require_live=False)
     if sink is None:
-        sink = HttpSink(s) if s.mode == "live" else MockSink()
+        sink = ChertSink(s) if s.mode == "live" else MockSink()
     if channel is None:
         channel = MockChannel()
     RUNTIME = RuntimeHandles(

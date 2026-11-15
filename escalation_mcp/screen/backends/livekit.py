@@ -1,5 +1,3 @@
-"""Publish screenshare frames into a LiveKit room."""
-
 from __future__ import annotations
 
 import asyncio
@@ -13,6 +11,8 @@ if TYPE_CHECKING:
     from escalation_mcp.screen.capture import CaptureLoop
 
 logger = logging.getLogger("escalation_mcp")
+
+W, H, FPS = 1280, 720, 10
 
 
 class LiveKitScreenBackend(ScreenBackend):
@@ -31,27 +31,23 @@ class LiveKitScreenBackend(ScreenBackend):
         from livekit import rtc
 
         self._capture = frame_source
-        # Ensure we have at least one frame for dimensions
         if self._capture.latest_rgba is None:
             self._capture.capture_once()
-        assert self._capture.latest_rgba is not None
-        w, h = self._capture.latest_rgba.size
-
         if not self._room_conn.room or not self._room_conn.connected:
             raise RuntimeError("LiveKit room not connected")
 
-        self._source = rtc.VideoSource(w, h)
-        self._track = rtc.LocalVideoTrack.create_video_track(
-            "screenshare", self._source
-        )
+        self._source = rtc.VideoSource(W, H)
+        self._track = rtc.LocalVideoTrack.create_video_track("agent-video", self._source)
         options = rtc.TrackPublishOptions()
-        options.source = rtc.TrackSource.SOURCE_SCREENSHARE
+        options.source = rtc.TrackSource.SOURCE_CAMERA
+        options.video_codec = rtc.VideoCodec.H264
+        options.simulcast = False
         self._publication = await self._room_conn.room.local_participant.publish_track(
             self._track, options
         )
         self._stop.clear()
         self._task = asyncio.create_task(self._push_frames(), name="lk-screen-push")
-        logger.info("published LiveKit screenshare track %sx%s", w, h)
+        logger.info("published agent camera track %sx%s (H.264)", W, H)
 
     async def _push_frames(self) -> None:
         from livekit import rtc
@@ -59,16 +55,15 @@ class LiveKitScreenBackend(ScreenBackend):
         while not self._stop.is_set():
             try:
                 if self._capture and self._capture.latest_rgba is not None and self._source:
-                    img = self._capture.latest_rgba.convert("RGBA")
-                    w, h = img.size
-                    argb = bytearray(img.tobytes())
-                    # Pillow RGBA -> LiveKit expects RGBA in VideoFrame
-                    frame = rtc.VideoFrame(w, h, rtc.VideoBufferType.RGBA, argb)
-                    self._source.capture_frame(frame)
+                    img = self._capture.latest_rgba.convert("RGBA").resize((W, H))
+                    img.putalpha(255)  # opaque, or FaceTime renders black
+                    self._source.capture_frame(
+                        rtc.VideoFrame(W, H, rtc.VideoBufferType.RGBA, img.tobytes())
+                    )
             except Exception:  # noqa: BLE001
                 logger.exception("LiveKit frame push failed")
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=0.2)
+                await asyncio.wait_for(self._stop.wait(), timeout=1 / FPS)
             except asyncio.TimeoutError:
                 pass
 
@@ -83,11 +78,9 @@ class LiveKitScreenBackend(ScreenBackend):
             self._task = None
         if self._publication and self._room_conn.room:
             try:
-                await self._room_conn.room.local_participant.unpublish_track(
-                    self._publication.sid
-                )
+                await self._room_conn.room.local_participant.unpublish_track(self._publication.sid)
             except Exception:  # noqa: BLE001
-                logger.exception("unpublish screenshare failed")
+                logger.exception("unpublish agent video failed")
         self._publication = None
         self._track = None
         self._source = None
