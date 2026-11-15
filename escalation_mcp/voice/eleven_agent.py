@@ -405,6 +405,9 @@ class ElevenAgentBridge:
 
         client_tools = ClientTools(loop=self._loop)
         client_tools.register("send_to_grok", self._send_to_grok, is_async=True)
+        # Screen camera (must also be declared as client tools in the dashboard).
+        client_tools.register("show_code", self._show_code, is_async=True)
+        client_tools.register("show_full_screen", self._show_full_screen, is_async=True)
 
         # Prompt + greeting live in the repo (skills/mentor_voice.md) and are
         # sent per call, if the agent allows overrides (dashboard → Security).
@@ -568,6 +571,38 @@ class ElevenAgentBridge:
             logger.exception("hangup after agent end_call failed")
 
     # ---- caller → Grok ----
+    async def _show_code(self, parameters: dict) -> str:
+        """Client tool: zoom the caller's screen onto a code line. Always returns a string."""
+        query = str(parameters.get("query") or parameters.get("target") or "").strip()
+        if not query:
+            return "error: pass query = 'path:line' from the incident's code_anchors, or a short code snippet"
+        try:
+            from escalation_mcp import session as sess
+
+            result = await sess.focus_code(self._packet.incident_id, query, source="facetime-mentor")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("show_code failed")
+            return f"Could not move the screen: {exc}. Keep talking without it."
+        if result.get("ok"):
+            return (
+                f"The caller's screen is now zoomed on {result.get('target')} (highlighted line). "
+                "Refer to it naturally, e.g. 'see that highlighted line'."
+            )
+        return (
+            f"Could not show it ({result.get('error')}). The caller sees the full screen; "
+            "describe it in words instead."
+        )
+
+    async def _show_full_screen(self, parameters: dict) -> str:
+        try:
+            from escalation_mcp import session as sess
+
+            await sess.show_full_screen(self._packet.incident_id, source="facetime-mentor")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("show_full_screen failed")
+            return f"Could not change the screen: {exc}"
+        return "The caller now sees their whole screen again."
+
     async def _send_to_grok(self, parameters: dict) -> str:
         raw = str(parameters.get("decision") or "").strip().lower()
         text = parameters.get("text")

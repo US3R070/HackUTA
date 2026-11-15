@@ -19,6 +19,7 @@ Steps:
      failure_type="nan",
      severity="HIGH",
      share="screen",
+     focus="demo/configs/bad_lr.yaml:1",
      proposed_fix="Lower lr from 5.0 to 3e-4 in demo/configs/bad_lr.yaml.",
      details={
        "config": {"lr": 5.0},
@@ -29,7 +30,8 @@ Steps:
    You may now read demo/configs/bad_lr.yaml so the edit is instant later. Do not edit it yet.
 3. Loop get_human_response(wait_seconds=25):
    - "none": call it again immediately.
-   - "approve": set lr to 3.0e-4 in demo/configs/bad_lr.yaml (one edit), report_action done, then
+   - "approve": set lr to 3.0e-4 in demo/configs/bad_lr.yaml (one edit), report_action done,
+       focus_code(incident_id, "demo/configs/bad_lr.yaml:1") so the caller sees the new value, then
        fix_done(incident_id, summary="Changed lr from 5.0 to 3e-4 in the bad-LR config. That keeps each update small and stable, so the next run's loss should drop smoothly instead of exploding.")
      then go back to looping get_human_response (the caller may ask for more).
    - "instruction": do what the text asks if it is safe and within demo/configs/*.yaml, then fix_done with what you changed and why
