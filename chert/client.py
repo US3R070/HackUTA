@@ -4,6 +4,23 @@ import urllib.error
 import urllib.request
 import uuid
 
+from pathlib import Path
+
+QUEUE_FILE = Path("runs/.chert_queue_id")
+
+
+def cancel_stale_queue() -> None:
+    if not QUEUE_FILE.exists():
+        return
+    qid = QUEUE_FILE.read_text().strip()
+    req = urllib.request.Request(f"{FACETIME_BASE}/calls/queue/{qid}", method="DELETE", headers=_headers())
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        print(f"[chert] cancelled stale queue entry {qid}")
+    except urllib.error.HTTPError:
+        pass
+    QUEUE_FILE.unlink(missing_ok=True)
+
 FACETIME_BASE = "https://facetime.trychert.com/api/v1"
 
 
@@ -28,6 +45,7 @@ def _get(path: str) -> dict:
 def place_call(destination: str, participant_token: str, agent_identity: str = "agent",
                video: bool = True, max_wait_s: float = 120) -> dict:
     is_phone = destination.startswith("+")
+    cancel_stale_queue()
     body = json.dumps({
         "direction": "outbound",
         "mode": "customer_managed",
@@ -52,9 +70,20 @@ def place_call(destination: str, participant_token: str, agent_identity: str = "
             raise RuntimeError(f"Chert {e.code}: {e.read().decode()[:500]}") from None
 
         if not data.get("queued"):
-            return data  # real call: data["id"]
+            QUEUE_FILE.unlink(missing_ok=True)
+            call = data.get("call") or data
+            if "id" not in call and (data.get("queue") or {}).get("call_id"):
+                call = _get(f"/calls/{data['queue']['call_id']}")
+            if "id" not in call:
+                raise RuntimeError(f"unexpected Chert response: {json.dumps(data)[:400]}")
+            return call
+        if (data.get("queue") or {}).get("call_id"):          # queue already turned into a call
+            QUEUE_FILE.unlink(missing_ok=True)
+            return _get(f"/calls/{data['queue']['call_id']}")
 
         q = data["queue"]
+        QUEUE_FILE.parent.mkdir(exist_ok=True)
+        QUEUE_FILE.write_text(q["id"])
         print(f"[chert] line busy, queued at position {q.get('position')} ...")
         while time.time() < deadline:
             time.sleep(3)
