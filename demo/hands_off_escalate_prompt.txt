@@ -1,21 +1,33 @@
-You are running a hands-off FaceTime escalation. Follow the escalate skill. Do not ask me for follow-up prompts in this TUI until the escalation has ended.
+You are running a hands-off FaceTime escalation. Follow the escalate skill.
 
-1. Call escalate_failure with:
-   title="Live NaN loss demo"
-   summary="Training hit NaN. Learning rate is too high; propose lowering it to 3e-4."
-   failure_type="nan"
-   severity="HIGH"
-   share="screen"
-   proposed_fix="Lower lr to 3e-4 in demo/configs/bad_lr.yaml."
+CRITICAL RULES:
+- You MUST call escalate_failure with share="screen" FIRST. Do not skip it.
+- Do NOT inspect or edit demo/configs/bad_lr.yaml until AFTER get_human_response returns approve from FaceTime.
+- Even if the file already looks fixed, still escalate — this is a live call demo.
+- Do not ask me for follow-up prompts in this TUI until end_escalation.
+- Never wait for keyboard approval — tools are pre-approved.
+- Stay in the tool loop; do not end the session early.
 
+Steps:
+1. escalate_failure(
+     title="Live NaN loss demo",
+     summary="Training hit NaN. Learning rate is too high; propose lowering it to 3e-4.",
+     failure_type="nan",
+     severity="HIGH",
+     share="screen",
+     proposed_fix="Lower lr to 3e-4 in demo/configs/bad_lr.yaml."
+   )
 2. report_action once that the live share is open.
+3. Loop get_human_response(wait_seconds=25) until decision != "none".
+   Human is on FaceTime only — their yes/no arrives via this tool.
+4. On approve:
+   - Edit demo/configs/bad_lr.yaml so lr is 3.0e-4
+   - report_action started/done
+   - speak_to_caller: "There we go — I fixed it for you. Is there anything else you'd like me to do?"
+   - Wait duration_s
+   - get_human_response(wait_seconds=20) once
+   - If none: speak_to_caller "Alright, hanging up now. Good luck with the run."
+   - Wait duration_s, then end_escalation(outcome="resolved")
+5. On reject/stop: speak a short goodbye, wait duration_s, end_escalation(outcome="aborted") without editing.
 
-3. Immediately loop get_human_response(wait_seconds=25) until decision is not "none".
-   - The human is on FaceTime. Their approve/reject/stop/instruction arrives through this tool only.
-   - Do not stop and wait for me to type in this chat.
-
-4. On approve: edit demo/configs/bad_lr.yaml so lr is 3.0e-4, report_action started/done, end_escalation(outcome="resolved").
-5. On reject or stop: end_escalation(outcome="aborted") without applying the fix.
-6. On instruction: follow if safe, report_action, then keep looping.
-
-Only after end_escalation may you summarize for me in this TUI.
+Only after end_escalation may you summarize in this TUI.

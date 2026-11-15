@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("escalation_mcp")
 
-W, H, FPS = 1280, 720, 15  # match screen_test.py; Chert is happier at ≥10–15 fps
+W, H, FPS = 1280, 720, 20  # higher fps → keyframes more often (less gray on join)
 
 
 class LiveKitScreenBackend(ScreenBackend):
@@ -26,6 +26,29 @@ class LiveKitScreenBackend(ScreenBackend):
         self._source: Any | None = None
         self._track: Any | None = None
         self._publication: Any | None = None
+        room_conn.add_bridge_joined_hook(self._on_subscriber_likely)
+        room_conn.add_call_answered_hook(self._on_subscriber_likely)
+
+    def _on_subscriber_likely(self) -> None:
+        # FaceTime often stays gray until the next H.264 keyframe. Mute/unmute
+        # nudges the encoder when Chert / the phone starts watching.
+        asyncio.create_task(self.refresh_for_subscriber(), name="lk-video-refresh")
+
+    async def refresh_for_subscriber(self) -> None:
+        track = self._track
+        if track is None:
+            return
+        try:
+            logger.info("refreshing video track for new subscriber (keyframe nudge)")
+            track.mute()
+            await asyncio.sleep(0.08)
+            track.unmute()
+            # Push a burst of frames immediately after unmute.
+            for _ in range(8):
+                await self._push_one_frame()
+                await asyncio.sleep(0.03)
+        except Exception:  # noqa: BLE001
+            logger.exception("video refresh for subscriber failed")
 
     async def start(self, frame_source: "CaptureLoop") -> None:
         from livekit import rtc
@@ -39,7 +62,8 @@ class LiveKitScreenBackend(ScreenBackend):
         self._source = rtc.VideoSource(W, H)
         self._track = rtc.LocalVideoTrack.create_video_track("agent-video", self._source)
         options = rtc.TrackPublishOptions()
-        options.source = rtc.TrackSource.SOURCE_CAMERA
+        # Screenshare source matches the product and can keyframe more eagerly.
+        options.source = rtc.TrackSource.SOURCE_SCREENSHARE
         options.video_codec = rtc.VideoCodec.H264
         options.simulcast = False
         self._publication = await self._room_conn.room.local_participant.publish_track(
@@ -47,25 +71,26 @@ class LiveKitScreenBackend(ScreenBackend):
         )
         self._stop.clear()
         self._task = asyncio.create_task(self._push_frames(), name="lk-screen-push")
-        logger.info("published agent camera track %sx%s (H.264)", W, H)
+        logger.info("published agent screenshare track %sx%s (H.264)", W, H)
 
-    async def _push_frames(self) -> None:
+    async def _push_one_frame(self) -> None:
         import numpy as np
         from livekit import rtc
 
+        if not self._capture or self._capture.latest_rgba is None or not self._source:
+            return
+        img = self._capture.latest_rgba.convert("RGBA").resize((W, H))
+        rgba = np.asarray(img, dtype=np.uint8)
+        bgra = np.ascontiguousarray(rgba[:, :, [2, 1, 0, 3]])
+        bgra[:, :, 3] = 255
+        self._source.capture_frame(
+            rtc.VideoFrame(W, H, rtc.VideoBufferType.BGRA, bgra.tobytes())
+        )
+
+    async def _push_frames(self) -> None:
         while not self._stop.is_set():
             try:
-                if self._capture and self._capture.latest_rgba is not None and self._source:
-                    # Match screen_test.py: Chert/FaceTime expects BGRA + opaque alpha.
-                    # RGBA here shows as gray/wrong colors on the phone even when
-                    # the local MJPEG preview (JPEG) looks fine.
-                    img = self._capture.latest_rgba.convert("RGBA").resize((W, H))
-                    rgba = np.asarray(img, dtype=np.uint8)
-                    bgra = np.ascontiguousarray(rgba[:, :, [2, 1, 0, 3]])
-                    bgra[:, :, 3] = 255
-                    self._source.capture_frame(
-                        rtc.VideoFrame(W, H, rtc.VideoBufferType.BGRA, bgra.tobytes())
-                    )
+                await self._push_one_frame()
             except Exception:  # noqa: BLE001
                 logger.exception("LiveKit frame push failed")
             try:

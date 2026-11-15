@@ -92,6 +92,8 @@ class LiveKitRoomConnection:
         self.bridge_joined = asyncio.Event()
         # Set when we receive the first audio frame from Chert (call answered).
         self.remote_audio_started = asyncio.Event()
+        self._bridge_joined_hooks: list[Callable[[], None]] = []
+        self._call_answered_hooks: list[Callable[[], None]] = []
 
     @property
     def connected(self) -> bool:
@@ -119,6 +121,14 @@ class LiveKitRoomConnection:
 
     def enable_idle_tone(self, enabled: bool = True) -> None:
         self._idle_enabled = enabled
+
+    def add_bridge_joined_hook(self, hook: Callable[[], None]) -> None:
+        if hook not in self._bridge_joined_hooks:
+            self._bridge_joined_hooks.append(hook)
+
+    def add_call_answered_hook(self, hook: Callable[[], None]) -> None:
+        if hook not in self._call_answered_hooks:
+            self._call_answered_hooks.append(hook)
 
     # ---- audio ----
     def play_pcm(self, pcm: bytes) -> None:
@@ -169,13 +179,14 @@ class LiveKitRoomConnection:
         def _on_participant(p: Any) -> None:
             if getattr(p, "identity", "") == BRIDGE_IDENTITY:
                 self.bridge_joined.set()
-                # Skip chime when ElevenLabs Mentor will greet — chime + early
-                # TTS overlaps the FaceTime gray window and sounds like static.
-                if (os.getenv("ELEVENLABS_AGENT_ID") or "").strip():
-                    logger.info("Chert bridge joined; waiting for Mentor voice")
-                else:
-                    logger.info("Chert bridge joined; playing chime to wake video")
-                    self.play_pcm(CHIME)
+                # Short wake chirp helps Chert attach the video track sooner.
+                logger.info("Chert bridge joined; wake chirp for video")
+                self.play_pcm(CHIME)
+                for hook in list(self._bridge_joined_hooks):
+                    try:
+                        hook()
+                    except Exception:  # noqa: BLE001
+                        logger.exception("bridge_joined hook failed")
 
         @self.room.on("track_subscribed")
         def _on_track_subscribed(track: Any, publication: Any, participant: Any) -> None:
@@ -226,6 +237,11 @@ class LiveKitRoomConnection:
                     if not self.remote_audio_started.is_set():
                         logger.info("first remote audio frame — call media is live")
                         self.remote_audio_started.set()
+                        for hook in list(self._call_answered_hooks):
+                            try:
+                                hook()
+                            except Exception:  # noqa: BLE001
+                                logger.exception("call_answered hook failed")
                 sink = self._user_audio_sink
                 if sink is None:
                     continue

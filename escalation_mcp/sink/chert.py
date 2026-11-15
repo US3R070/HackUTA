@@ -27,7 +27,9 @@ class ChertSink(Sink):
         if packet.severity != "HIGH":
             return []  # LOW: iMessage only (later)
         try:
-            await asyncio.sleep(1.0)  # let agent audio+video start before Chert joins
+            # Warm H.264 before dialing so the first subscriber gets a recent
+            # keyframe sooner.
+            await asyncio.sleep(2.5)
             token = mint_token(self.settings, identity=BRIDGE_IDENTITY, room=packet.media.room)
             call = await asyncio.to_thread(
                 place_call, os.environ["USER_PHONE"], token, SCREEN_IDENTITY, True

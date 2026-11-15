@@ -313,4 +313,5 @@ class ElevenAgentBridge:
             decision.decision,
             (decision.text or "")[:80],
         )
-        return {"ok": True, "decision": decision.decision, "queued": True}
+        # ElevenLabs client_tool_result.result must be a string (dict → 1008 close).
+        return f"queued decision={decision.decision}"

@@ -586,6 +586,44 @@ async def set_screen_view(incident_id: str, view: str) -> dict[str, Any]:
     return result
 
 
+async def speak_to_caller(incident_id: str, text: str) -> dict[str, Any]:
+    """Speak a short line on the live FaceTime call via ElevenLabs TTS.
+
+    Uses ELEVENLABS_VOICE_ID, or the voice configured on ELEVENLABS_AGENT_ID.
+    (Do not use conversation send_user_message — it closes the Mentor socket.)
+    """
+    STATE.require(incident_id)
+    text = (text or "").strip()
+    if not text:
+        return {"ok": False, "error": "empty text"}
+
+    room_conn = RUNTIME.room_conn
+    if room_conn is None or not room_conn.connected:
+        return {"ok": False, "error": "no live call / LiveKit room"}
+
+    from escalation_mcp.voice.tts import synthesize_pcm48
+
+    try:
+        pcm48 = await asyncio.to_thread(synthesize_pcm48, text)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("speak_to_caller TTS failed")
+        return {"ok": False, "error": str(exc)}
+
+    room_conn.play_pcm(pcm48)
+    duration_s = max(0.8, len(pcm48) / (48000 * 2))
+    append_agent_log(
+        incident_id,
+        {
+            "ts": _utc_now_iso(),
+            "tool": "speak_to_caller",
+            "text": text[:200],
+            "duration_s": round(duration_s, 2),
+            "via": "tts",
+        },
+    )
+    return {"ok": True, "duration_s": round(duration_s, 2), "via": "tts"}
+
+
 async def end_escalation(
     incident_id: str,
     outcome: str,

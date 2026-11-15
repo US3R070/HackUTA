@@ -93,12 +93,25 @@ async def set_screen_view(incident_id: str, view: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+async def speak_to_caller(incident_id: str, text: str) -> dict[str, Any]:
+    """Speak a short line on the live FaceTime call (ElevenLabs TTS).
+
+    Use after applying a fix ("There we go, I fixed it…") and again for goodbye
+    before end_escalation. Returns duration_s — wait that long before hanging up.
+    """
+    return await sess.speak_to_caller(incident_id, text)
+
+
+@mcp.tool()
 async def end_escalation(
     incident_id: str,
     outcome: Literal["resolved", "aborted", "handed_off"],
     summary: str,
 ) -> dict[str, Any]:
-    """Finish the escalation: final report, stop screen share, leave room."""
+    """Finish the escalation: final report, stop screen share, leave room.
+
+    Speak goodbye with speak_to_caller first and wait duration_s before calling this.
+    """
     return await sess.end_escalation(incident_id, outcome, summary)
 
 
