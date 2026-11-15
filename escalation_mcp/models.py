@@ -16,7 +16,7 @@ class MediaInfo(BaseModel):
     transport: str = "livekit"
     livekit_url: str = ""
     room: str = ""
-    screen_participant: str = "local-screen"
+    screen_participant: str = "agent"
     preview_url: str = ""
 
 

@@ -74,7 +74,7 @@ def load_settings(*, require_live: bool | None = None) -> Settings:
         in ("1", "true", "True", "yes"),
         screen_default=os.getenv("SCREEN_DEFAULT") or "screen",
         screen_monitor=int(os.getenv("SCREEN_MONITOR") or "1"),
-        screen_fps=float(os.getenv("SCREEN_FPS") or "5"),
+        screen_fps=float(os.getenv("SCREEN_FPS") or "10"),
         screen_max_width=int(os.getenv("SCREEN_MAX_WIDTH") or "1280"),
         preview_port=int(os.getenv("PREVIEW_PORT") or "8765"),
         livekit_url=os.getenv("LIVEKIT_URL") or "",
@@ -84,17 +84,17 @@ def load_settings(*, require_live: bool | None = None) -> Settings:
 
     check_live = require_live if require_live is not None else (mode == "live")
     if check_live:
-        missing = []
-        if not settings.livekit_url:
-            missing.append("LIVEKIT_URL")
-        if not settings.livekit_api_key:
-            missing.append("LIVEKIT_API_KEY")
-        if not settings.livekit_api_secret:
-            missing.append("LIVEKIT_API_SECRET")
-        if not settings.chert_agent_url:
-            missing.append("CHERT_AGENT_URL")
-        if not settings.escalation_shared_secret:
-            missing.append("ESCALATION_SHARED_SECRET")
+        required = [
+            ("LIVEKIT_URL", settings.livekit_url),
+            ("LIVEKIT_API_KEY", settings.livekit_api_key),
+            ("LIVEKIT_API_SECRET", settings.livekit_api_secret),
+            # Chert call (chert/client.py + sink/chert.py)
+            ("CHERT_API_KEY", os.getenv("CHERT_API_KEY")),
+            ("CHERT_PROJECT_ID", os.getenv("CHERT_PROJECT_ID")),
+            ("CHERT_LINE_ID", os.getenv("CHERT_LINE_ID")),
+            ("USER_PHONE", os.getenv("USER_PHONE")),
+        ]
+        missing = [name for name, val in required if not val]
         if missing:
             raise RuntimeError(
                 "live mode requires missing env vars: " + ", ".join(missing)
