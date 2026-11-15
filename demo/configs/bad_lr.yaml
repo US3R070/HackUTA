@@ -1,4 +1,4 @@
-lr: 3.0e-4     # lowered from 5.0 after NaN; resume from checkpoint
+lr: 5.0        # deliberately too high -> NaN ~2 min in (tune)
 batch_size: 64
 steps: 5000
 log_every: 10
