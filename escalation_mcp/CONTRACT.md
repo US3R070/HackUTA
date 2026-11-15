@@ -25,6 +25,7 @@ Creates / notifies about an escalation.
   "title": "Training run crashed: NaN loss at step 4200",
   "summary": "Loss became NaN at step 4200. Learning rate 5.0 looks too high.",
   "proposed_fix": "Lower lr to 3e-4 and resume from the step-4000 checkpoint.",
+  "default_action": "Keep the run paused at checkpoint 4000 and text a summary.",
   "run_id": "run_2026-11-14_1530",
   "details": {
     "traceback": "...",
@@ -53,6 +54,7 @@ Notes:
 - `contacts` comes from `ESCALATION_CONTACTS` (optional); cloud may ignore and use its own list.
 - **Never** include LiveKit API secrets in the packet. Cloud mints caller tokens with the same LiveKit project credentials.
 - `preview_url` is local-only / informational.
+- `default_action` is what the agent does if the human never decides (no answer after one redial, hangs up, or goes idle). Always non-destructive. **The call agent should say it in its opening line**, e.g. "If you hang up, I'll keep the run paused at checkpoint 4000."
 
 ### `POST {CHERT_AGENT_URL}/escalations/{incident_id}/report`
 
@@ -66,6 +68,14 @@ Final report when the local side ends the escalation:
   "actions": [{ "type": "action", "seq": 1, "action": "...", "...": "..." }]
 }
 ```
+
+### `POST {CHERT_AGENT_URL}/escalations/{incident_id}/redial` (HTTP sink only)
+
+Nobody joined within `CALL_NO_ANSWER_S`. Body: `{"attempt": 2}`. Place the call again. (With the current `ChertSink` the laptop redials Chert directly.)
+
+### `POST {CHERT_AGENT_URL}/escalations/{incident_id}/hangup` (HTTP sink only)
+
+The call is over on the local side (idle timeout, agent done, etc.). Hang up the phone leg. Body: `{}`.
 
 ### `POST {CHERT_AGENT_URL}/escalations/{incident_id}/events` (optional)
 
@@ -92,11 +102,40 @@ Local joins room `esc-<incident_id>` as identity `local-screen`.
   "type": "decision",
   "incident_id": "...",
   "ts": "ISO",
-  "decision": "approve|reject|stop|instruction",
+  "decision": "approve|reject|stop|instruction|hangup",
   "text": "lower the LR and resume",
   "from": "<participant name>"
 }
+
+// call_state (local -> cloud, on agent_events) - sent on every phase change
+{
+  "type": "call_state",
+  "incident_id": "...",
+  "ts": "ISO",
+  "state": "waiting_answer|live|watching|agent_done|ended",
+  "reason": null,              // when ended: hangup|caller_left|idle_timeout|agent_done|no_answer|reset
+  "attempt": 1,
+  "ends_in_s": 118.5,
+  "default_action": "..."
+}
 ```
+
+## Call lifecycle
+
+A decision does **not** end the call. The monitor stays live so the human can watch the fix run and keep giving instructions.
+
+| Phase | Entered when | Ends / moves on when |
+|---|---|---|
+| `waiting_answer` | call placed | caller joins or sends a decision -> `live`; no join in `CALL_NO_ANSWER_S` -> redial once, then `ended(no_answer)` |
+| `live` | caller joined | first decision -> `watching`. **No timer**: without a decision channel the call stays up until hang-up / caller leaves / agent done |
+| `watching` | any decision | `CALL_IDLE_TIMEOUT_S` after the last decision -> `ended(idle_timeout)`; each decision resets it |
+| `agent_done` | agent called `end_escalation` | `CALL_DONE_GRACE_S` after the agent finished or the human last spoke -> `ended(agent_done)` |
+| `ended` | `hangup` decision, caller left (> `CALL_LEAVE_GRACE_S`), or a timer | final |
+
+Cloud call agent responsibilities:
+- When the human says they are done ("that's all, hang up"), send `decision: "hangup"`.
+- When it receives `call_state` with `state: "ended"`, say goodbye and drop the call.
+- Caller presence is detected locally from the LiveKit room: the Chert bridge participant (`chert-bridge`) joining / leaving.
 
 Ignore and log messages with unknown `type` or mismatched `incident_id`.
 

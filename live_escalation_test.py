@@ -29,7 +29,7 @@ async def main():
     try:
         await asyncio.Event().wait()
     finally:
-        await sess.end_escalation(iid, "aborted", "test ended")
+        await sess.end_escalation(iid, "aborted", "test ended", hang_up_now=True)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from escalation_mcp.channel.base import Channel, DecisionHandler
+from escalation_mcp.channel.base import Channel, DecisionHandler, PresenceHandler
 from escalation_mcp.models import ActionEvent, HumanDecision
 from escalation_mcp.packet import incident_dir, redact_value
 
@@ -21,6 +21,7 @@ class MockChannel(Channel):
     def __init__(self) -> None:
         self._incident_id: str | None = None
         self._on_decision: DecisionHandler | None = None
+        self._on_presence: PresenceHandler | None = None
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         self._inbox_offset = 0
@@ -34,9 +35,15 @@ class MockChannel(Channel):
         inbox.touch(exist_ok=True)
         return outbox, inbox
 
-    async def start(self, incident_id: str, on_decision: DecisionHandler) -> None:
+    async def start(
+        self,
+        incident_id: str,
+        on_decision: DecisionHandler,
+        on_presence: PresenceHandler | None = None,
+    ) -> None:
         self._incident_id = incident_id
         self._on_decision = on_decision
+        self._on_presence = on_presence
         self._stop.clear()
         _, inbox = self._paths()
         # Start from end so pre-existing lines are ignored unless newly appended
@@ -72,6 +79,14 @@ class MockChannel(Channel):
             logger.warning("invalid inbox JSON: %s", line[:120])
             return
         msg_type = data.get("type")
+        if msg_type == "presence":
+            if data.get("incident_id") != self._incident_id:
+                logger.warning("inbox presence incident_id mismatch")
+                return
+            event = data.get("event")
+            if event in ("joined", "left") and self._on_presence is not None:
+                await self._on_presence(event)
+            return
         if msg_type != "decision":
             logger.info("ignoring inbox message type=%s", msg_type)
             return

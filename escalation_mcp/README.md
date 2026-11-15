@@ -31,8 +31,31 @@ cp .env.example .env   # set ESCALATION_MODE=mock for local work
    python -m escalation_mcp.simulate <incident_id> approve
    ```
 
-6. Call `get_human_response` → `decision=approve`.
-7. Call `end_escalation`. Check `runs/<incident_id>/` for `packet.json`, `agent_log.jsonl`, `outbox.jsonl`, `mcp.log`.
+6. Call `get_human_response` → `decision=approve`, `call_state=watching`. The preview keeps streaming.
+7. Simulate the rest of the call:
+
+   ```bash
+   python -m escalation_mcp.simulate <incident_id> join      # you picked up
+   python -m escalation_mcp.simulate <incident_id> "also drop batch 4200"
+   python -m escalation_mcp.simulate <incident_id> hangup    # "that's all, bye"
+   python -m escalation_mcp.simulate <incident_id> leave     # you hung up the phone
+   ```
+
+8. Call `end_escalation`. Check `runs/<incident_id>/` for `packet.json`, `agent_log.jsonl`, `outbox.jsonl` (includes `call_state` events), `mcp.log`.
+
+### Call lifecycle
+
+Decisions no longer tear down the stream. The call ends on a verbal `hangup`, the caller leaving (`CALL_LEAVE_GRACE_S`, default 5 s, to rejoin), or a timer:
+
+| Env | Default | Meaning |
+|---|---|---|
+| `CALL_NO_ANSWER_S` | 60 | wait for pickup per attempt (starts after Chert accepts the call; never redials over a call Chert still reports as active) |
+| `CALL_MAX_ATTEMPTS` | 2 | total dial attempts (1 redial) |
+| `CALL_IDLE_TIMEOUT_S` | 120 | after the first decision, hang up after this long with no new one (demo: 30–45). Before any decision there is no timer |
+| `CALL_DONE_GRACE_S` | 30 | keep the monitor up after `end_escalation` |
+| `CALL_LEAVE_GRACE_S` | 5 | caller can rejoin within this window |
+
+If the call ends without any human decision, `get_human_response` returns `run_default_action: true` and the agent performs its declared, non-destructive `default_action`. The overlay shows `WATCHING · You: approve · auto-hangup 1:42`.
 
 Standalone failure demo:
 
@@ -125,9 +148,9 @@ Pin `mcp>=1.0,<2` — MCP 2.x renamed FastMCP.
 |------|---------|
 | `escalate_failure` | Create incident, share screen, send packet |
 | `report_action` | Overlay + `agent_events` narration |
-| `get_human_response` | Poll / long-poll human decisions |
+| `get_human_response` | Poll / long-poll human decisions + `call_state` |
 | `set_screen_view` | `screen` / `window:…` / `image:…` |
-| `end_escalation` | Final report, tear down |
+| `end_escalation` | Agent done; grace period if the human is still watching, then final report + tear down |
 
 ## Known limitations
 

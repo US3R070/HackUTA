@@ -33,3 +33,14 @@ class MockSink(Sink):
         )
         logger.info("mock sink saved final report for %s", incident_id)
         return []
+
+    async def redial(self, packet: EscalationPacket, attempt: int) -> list[str]:
+        path = incident_dir(packet.incident_id) / "redials.jsonl"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"attempt": attempt}) + "\n")
+        logger.info("mock sink redial attempt %d for %s", attempt, packet.incident_id)
+        return []
+
+    async def end_call(self, incident_id: str) -> list[str]:
+        logger.info("mock sink end_call for %s", incident_id)
+        return []

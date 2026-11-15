@@ -40,6 +40,7 @@ def draw_overlay(
     severity: str,
     actions: Sequence[object],
     stop_from: str | None = None,
+    call_line: str | None = None,
 ) -> Image.Image:
     img = frame.convert("RGBA")
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
@@ -54,6 +55,16 @@ def draw_overlay(
     title_font = _font(max(12, top_h - 10))
     label = f"● LIVE · {title}"
     draw.text((10, max(2, (top_h - 14) // 2)), label, fill=(255, 255, 255, 255), font=title_font)
+
+    if call_line:
+        # Call status strip under the title: "WATCHING · You: approve · auto-hangup 1:42"
+        strip_h = max(22, top_h * 3 // 4)
+        strip_font = _font(max(11, strip_h - 8))
+        text_w = int(draw.textlength(call_line, font=strip_font)) + 20
+        x0 = max(0, w - text_w)
+        draw.rectangle([x0, top_h, w, top_h + strip_h], fill=(15, 15, 18, 215))
+        draw.text((x0 + 10, top_h + max(2, (strip_h - 14) // 2)), call_line,
+                  fill=(255, 255, 255, 255), font=strip_font)
 
     draw.rectangle([0, h - bottom_h, w, h], fill=(20, 20, 24, 210))
     line_font = _font(max(11, bottom_h // 5))

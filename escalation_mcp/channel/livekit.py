@@ -6,7 +6,7 @@ import json
 import logging
 from typing import Any
 
-from escalation_mcp.channel.base import Channel, DecisionHandler
+from escalation_mcp.channel.base import Channel, DecisionHandler, PresenceHandler
 from escalation_mcp.models import ActionEvent, HumanDecision
 from escalation_mcp.packet import redact_value
 
@@ -24,11 +24,22 @@ class LiveKitChannel(Channel):
         self._room_conn = room_conn
         self._incident_id: str | None = None
         self._on_decision: DecisionHandler | None = None
+        self._on_presence: PresenceHandler | None = None
 
-    async def start(self, incident_id: str, on_decision: DecisionHandler) -> None:
+    async def start(
+        self,
+        incident_id: str,
+        on_decision: DecisionHandler,
+        on_presence: PresenceHandler | None = None,
+    ) -> None:
         self._incident_id = incident_id
         self._on_decision = on_decision
+        self._on_presence = on_presence
         self._room_conn.add_data_handler(self._on_data)
+        if on_presence is not None:
+            self._room_conn.add_presence_handler(on_presence)
+            if self._room_conn.bridge_joined.is_set():
+                await on_presence("joined")  # bridge was faster than us
 
     async def _on_data(self, data: bytes, topic: str | None) -> None:
         if topic and topic != DECISIONS_TOPIC:
@@ -64,4 +75,7 @@ class LiveKitChannel(Channel):
 
     async def stop(self) -> None:
         self._room_conn.remove_data_handler(self._on_data)
+        if self._on_presence is not None:
+            self._room_conn.remove_presence_handler(self._on_presence)
         self._on_decision = None
+        self._on_presence = None
