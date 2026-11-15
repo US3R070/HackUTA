@@ -21,15 +21,20 @@ from .detectors import Plateau, log_failure, non_finite
 from .metrics import MetricsTail
 
 
+
 def clean(value):
     """Normalize non-standard NaN/Infinity to strict JSON before persistence."""
     if isinstance(value, float) and not math.isfinite(value):
         return None
+
     if isinstance(value, dict):
         return {k: clean(v) for k, v in value.items()}
+   
     if isinstance(value, (list, tuple)):
         return [clean(v) for v in value]
+   
     return value
+
 
 
 def atomic_json(path, value):
@@ -38,8 +43,8 @@ def atomic_json(path, value):
     os.replace(temporary, path)
 
 
-def watch(command, run_dir, cwd=None, config=None, poll=0.1,
-          plateau_steps=0, min_delta=0.001, on_incident=None):
+
+def watch(command, run_dir, cwd=None, config=None, poll=0.1, plateau_steps=0, min_delta=0.001, on_incident=None):
     """Return child's exit code; on_incident receives immutable JSON snapshots.
 
     A callback is invoked on first detection and severity/type upgrades only.
@@ -48,8 +53,10 @@ def watch(command, run_dir, cwd=None, config=None, poll=0.1,
     """
     if not command or poll <= 0 or not math.isfinite(poll):
         raise ValueError('A command and positive finite poll interval are required')
+    
     if plateau_steps < 0 or min_delta < 0 or not math.isfinite(min_delta):
         raise ValueError('Invalid plateau settings')
+    
     run_dir = Path(run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     incident_dir = run_dir / 'incidents'
@@ -70,6 +77,7 @@ def watch(command, run_dir, cwd=None, config=None, poll=0.1,
         lock = lock_path.open('x', encoding='utf-8')
     except FileExistsError:
         raise RuntimeError(f'Watcher lock exists: {lock_path}. Check for a running watcher before removing a stale lock.')
+    
     with lock:
         lock.write(str(os.getpid()))
     try:
@@ -205,6 +213,7 @@ def watch(command, run_dir, cwd=None, config=None, poll=0.1,
         lock_path.unlink(missing_ok=True)
 
 
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-dir', type=Path, required=True)
@@ -217,15 +226,18 @@ def main():
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     config = None
+    
     if args.config:
         import yaml
         config = yaml.safe_load(args.config.read_text(encoding='utf-8'))
         if not isinstance(config, dict):
             parser.error('--config must contain a YAML mapping')
+    
     if not command:
         parser.error('Provide a training command after --')
-    return watch(command, args.run_dir, args.cwd, config, args.poll,
-                 args.plateau_steps, args.min_delta)
+    
+    return watch(command, args.run_dir, args.cwd, config, args.poll, args.plateau_steps, args.min_delta)
+
 
 
 if __name__ == '__main__':
