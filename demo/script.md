@@ -5,10 +5,11 @@ and `watcher.Runner` implementation and the synthetic trainer in `train.py`.
 The trainer uses NumPy float32 and manual SGD on fixed synthetic data. It needs
 NumPy and PyYAML, but no dataset download, GPU, or PyTorch.
 
-The current `Runner` is a Python API, not a command-line module. The repository
-`main.py` is not implemented yet. This local demo exercises training and
-detection only; it does not send texts/calls, start a LiveKit agent, create
-incident JSON, or apply fixes.
+The current `Runner` is a Python API, not a command-line module. Use
+`main.py` to launch it with incident building, Grok triage, and the registered
+notification/escalation handlers. This launch flow does not automatically
+apply a code fix; the agent must get the user's approval before any fix is
+applied.
 
 ## Environment setup (Windows PowerShell)
 
@@ -36,11 +37,27 @@ Use a new run directory each time unless resuming from a checkpoint:
 ```
 
 `bad_lr.yaml` sets LR to 5.0. The warm-up normally caps LR at 0.001 for the
-first 1,000 steps; disabling warm-up and delay shortens the rehearsal. The
-trainer stops at its first non-finite update, writes a failure metric, reports
-the failure, and returns exit code 2. With defaults, the safe warm-up takes
-about two minutes before divergence; machine speed and I/O affect the timing.
+first `--warmup-steps` steps; its default is now zero. With the deliberately
+unstable model code and LR 5.0, the trainer is intended to fail within a
+minute. It stops at the first non-finite update, writes a failure metric,
+reports the failure, and returns exit code 2.
 `good.yaml` uses LR 0.001 and should complete without a numerical failure.
+
+## Run through the application launcher
+
+This starts the watcher and launches the model in `train.py`. `main.py` creates
+a timestamped run directory and substitutes it for `"{run_dir}"`. It also
+builds and saves the incident, requests Grok triage (or uses fallback triage),
+and invokes the registered notification and escalation handlers. Install the
+full `requirements.txt` dependencies and configure the required service values
+in the repository `.env` before using external notifications or calls.
+
+```powershell
+.\.venv\Scripts\python.exe main.py --config demo/configs/bad_lr.yaml -- .\.venv\Scripts\python.exe -u demo/train.py --config demo/configs/bad_lr.yaml --run-dir "{run_dir}"
+```
+
+This is the interactive application path. Use the direct command above when
+you only want to run the training process without triage or notification.
 
 ## Run the current watcher API
 
@@ -72,7 +89,7 @@ the same run directory.
 
 | Type | Detection rule |
 | --- | --- |
-| `nan` | A metric has non-finite loss, or has `event: "non_finite"` / `non_finite: true`; alternatively, a log line contains `loss` followed by `nan` or `inf`. |
+| `nan` | A parsed metric has numeric NaN/Inf, or a log line contains `loss` followed by `nan` or `inf`. `train.py` emits null loss values plus a `non_finite` event, so its `ERROR NaN/Inf detected...` log line is what the current detector recognizes. |
 | `oom` | A log line contains CUDA/MPS out-of-memory wording, `OutOfMemoryError`, or `out of memory`. |
 | `crash` | The process exits nonzero and no `nan`/`oom` kill detection suppressed exit classification. |
 | `plateau` | Loss improvement over the configured step window is below the relative threshold. Defaults: 500 steps and 1% minimum relative improvement. |
@@ -80,8 +97,9 @@ the same run directory.
 
 Each type fires at most once per `Detectors` instance. `Runner` terminates the
 child for `nan` and `oom`; it does not stop the child for plateau or overfit.
-The demo's immediate non-finite metric stores `null` for invalid loss values,
-so the detector uses its explicit event/flag as well as the log message.
+The demo's immediate non-finite metric stores `null` for invalid loss values.
+The current detector does not inspect the event/flag fields, so detection of
+this demo failure relies on its error log line.
 
 `MetricsTail.new_rows()` reads appended newline-delimited JSON incrementally.
 It buffers an incomplete final line until a newline arrives and skips blank or
