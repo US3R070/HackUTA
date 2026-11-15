@@ -1,0 +1,21 @@
+You are running a hands-off FaceTime escalation. Follow the escalate skill. Do not ask me for follow-up prompts in this TUI until the escalation has ended.
+
+1. Call escalate_failure with:
+   title="Live NaN loss demo"
+   summary="Training hit NaN. Learning rate is too high; propose lowering it to 3e-4."
+   failure_type="nan"
+   severity="HIGH"
+   share="screen"
+   proposed_fix="Lower lr to 3e-4 in demo/configs/bad_lr.yaml."
+
+2. report_action once that the live share is open.
+
+3. Immediately loop get_human_response(wait_seconds=25) until decision is not "none".
+   - The human is on FaceTime. Their approve/reject/stop/instruction arrives through this tool only.
+   - Do not stop and wait for me to type in this chat.
+
+4. On approve: edit demo/configs/bad_lr.yaml so lr is 3.0e-4, report_action started/done, end_escalation(outcome="resolved").
+5. On reject or stop: end_escalation(outcome="aborted") without applying the fix.
+6. On instruction: follow if safe, report_action, then keep looping.
+
+Only after end_escalation may you summarize for me in this TUI.

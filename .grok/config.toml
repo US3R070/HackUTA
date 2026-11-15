@@ -8,7 +8,7 @@ cwd = "/Users/ronismaili/PycharmProjects/HackUTA"
 enabled = true
 startup_timeout_sec = 30
 tool_timeout_sec = 60
-tool_timeouts = { get_human_response = 30 }
+tool_timeouts = { get_human_response = 60 }
 # live = real Chert/LiveKit call. Use mock for offline MCP tests.
 # AGENT_IDLE_TONE=0: silence between Mentor turns (continuous tone sounded like static).
 # FACETIME_AUDIO_GRACE_S: extra wait AFTER the call is answered (remote audio seen).

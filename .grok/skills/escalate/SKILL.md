@@ -21,15 +21,18 @@ Do **not** escalate trivial errors you can fix safely yourself.
 
 ## Protocol
 
-1. Call `escalate_failure` **once** with a speakable `summary` (<15s), `severity` (`LOW`|`HIGH`), `details`, and `proposed_fix` if any. Prefer `share="window:<terminal or IDE title>"` for privacy.
+1. Call `escalate_failure` **once** with a speakable `summary` (<15s), `severity` (`LOW`|`HIGH`), `details`, and `proposed_fix` if any. Prefer `share="screen"` for the FaceTime demo (or `window:<title>` for privacy).
 2. Narrate with `report_action` **before and after every meaningful step** (read file, run command, edit, test).
-3. **Between every step**, call `get_human_response(wait_seconds=0)`.
-   - On `stop`: halt immediately, revert uncommitted edits made during this incident, then `end_escalation(outcome="aborted")`.
-   - On `instruction`: follow it if safe; otherwise report why not via `report_action`.
-4. **Before any destructive or irreversible action**, call `get_human_response(wait_seconds=25)` in a loop until `approve` or `reject`. Never treat silence as approval.
+3. **Autonomous wait (required):** Right after `escalate_failure`, enter a loop and call `get_human_response(wait_seconds=25)` repeatedly until you get a real decision (`approve` / `reject` / `stop` / `instruction`). Do **not** stop and ask the TUI user what to do next — the human is on FaceTime; their yes/no arrives via this tool (from the Mentor voice bridge).
+   - On `none`: loop again immediately.
+   - On `approve`: apply the proposed fix, `report_action` started/done, then `end_escalation(outcome="resolved")`.
+   - On `reject`: do not edit; `end_escalation(outcome="aborted")`.
+   - On `stop`: halt, revert uncommitted edits from this incident, `end_escalation(outcome="aborted")`.
+   - On `instruction`: follow if safe; `report_action`; then keep looping for further decisions until approve/reject/stop.
+4. Never treat silence / `none` as approval.
 5. Use `set_screen_view` so the human sees what they need (traceback terminal, diff, rendered plot via `image:<path>`).
-6. **Repo boundary:** training fixes belong in the **train** repo (`C:\Users\USER\HackUTA\train`), on branch `agent/fix-<incident_id>`. Never create training fix branches or commit train patches inside the HackUTA (`escalation_mcp`) repo. Never push or merge without approval.
-7. Finish with `end_escalation` (`resolved` / `aborted` / `handed_off`). A real `get_human_response` decision may auto-reset preview on `:8765`.
+6. **Repo boundary (this HackUTA demo):** config fixes may edit `demo/configs/*.yaml` in this repo. For a separate train repo, use branch `agent/fix-<incident_id>` there instead. Never push or merge without approval.
+7. Finish with `end_escalation` (`resolved` / `aborted` / `handed_off`). Only then may you return control to the TUI user.
 
 Long commands: run them in the background and poll `get_human_response` — MCP cannot interrupt mid-command.
 
