@@ -470,10 +470,12 @@ async def start_escalation(
 
 
 async def _start_voice_bridge(packet: Any) -> None:
-    """Wait for Chert bridge + media grace, then start ElevenLabs on this participant.
+    """Start ElevenLabs only after the phone call is actually answered.
 
-    FaceTime shows gray for ~2–3s after answer while video attaches. If Mentor
-    greets immediately, the opening words are lost. Wait out that window first.
+    Bridge join happens while FaceTime is still ringing/gray. Greeting then
+    plays into a void and the caller only hears the tail. Wait for the first
+    remote audio frame from Chert (= answered + media flowing), then a short
+    extra grace for video to attach.
     """
     room_conn = RUNTIME.room_conn
     if room_conn is None:
@@ -484,9 +486,20 @@ async def _start_voice_bridge(packet: Any) -> None:
         logger.warning("ElevenLabs bridge: Chert bridge never joined; skipping voice")
         return
 
-    grace = float(os.getenv("FACETIME_AUDIO_GRACE_S") or "3.5")
-    logger.info("ElevenLabs bridge: waiting %.1fs for FaceTime video to attach", grace)
-    await asyncio.sleep(max(0.0, grace))
+    try:
+        logger.info("ElevenLabs bridge: waiting for answered FaceTime audio…")
+        await asyncio.wait_for(room_conn.remote_audio_started.wait(), timeout=120.0)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "ElevenLabs bridge: no remote audio (call unanswered?); starting anyway"
+        )
+
+    grace = float(os.getenv("FACETIME_AUDIO_GRACE_S") or "2.0")
+    if grace > 0:
+        logger.info(
+            "ElevenLabs bridge: +%.1fs after answer for FaceTime video attach", grace
+        )
+        await asyncio.sleep(grace)
 
     try:
         from escalation_mcp.voice.eleven_agent import ElevenAgentBridge

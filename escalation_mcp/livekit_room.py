@@ -90,6 +90,8 @@ class LiveKitRoomConnection:
         # static before the agent greets — leave off until first real speech.
         self._idle_enabled = False
         self.bridge_joined = asyncio.Event()
+        # Set when we receive the first audio frame from Chert (call answered).
+        self.remote_audio_started = asyncio.Event()
 
     @property
     def connected(self) -> bool:
@@ -151,6 +153,7 @@ class LiveKitRoomConnection:
         token = mint_token(self.settings, identity=identity, room=room)
         self.room = rtc.Room()
         self.bridge_joined.clear()
+        self.remote_audio_started.clear()
 
         @self.room.on("data_received")
         def _on_data(data_packet: Any) -> None:
@@ -206,19 +209,25 @@ class LiveKitRoomConnection:
         from livekit import rtc
 
         stream = rtc.AudioStream(track)
+        saw_frame = False
         try:
             async for event in stream:
                 if not self._connected:
                     break
-                sink = self._user_audio_sink
-                if sink is None:
-                    continue
                 frame = event.frame
                 try:
                     data = bytes(frame.data)
                     rate = int(frame.sample_rate)
                     channels = int(frame.num_channels)
                 except Exception:  # noqa: BLE001
+                    continue
+                if not saw_frame:
+                    saw_frame = True
+                    if not self.remote_audio_started.is_set():
+                        logger.info("first remote audio frame — call media is live")
+                        self.remote_audio_started.set()
+                sink = self._user_audio_sink
+                if sink is None:
                     continue
                 if channels > 1:
                     # downmix interleaved int16 → mono
