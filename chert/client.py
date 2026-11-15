@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -39,7 +40,7 @@ def cancel_stale_queue() -> None:
     )
     try:
         urllib.request.urlopen(req, timeout=10)
-        print(f"[chert] cancelled stale queue entry {qid}")
+        print(f"[chert] cancelled stale queue entry {qid}", file=sys.stderr, flush=True)
     except urllib.error.HTTPError:
         pass
     QUEUE_FILE.unlink(missing_ok=True)
@@ -117,20 +118,22 @@ def place_call(
 
         QUEUE_FILE.parent.mkdir(exist_ok=True)
         QUEUE_FILE.write_text(str(queue_id))
-        print(f"[chert] line busy, queued at position {q.get('position')} ...")
+        print(f"[chert] line busy, queued at position {q.get('position')} ...", file=sys.stderr, flush=True)
 
         while time.time() < deadline:
             time.sleep(3)
-            status = _get(f"/calls/queue/{queue_id}")
+            raw = _get(f"/calls/queue/{queue_id}")
+            # Chert nests the entry under data.queue ({"queued":..., "queue": {...}}).
+            status = raw.get("queue") if isinstance(raw.get("queue"), dict) else raw
             if status.get("call_id"):
                 QUEUE_FILE.unlink(missing_ok=True)
                 return _get(f"/calls/{status['call_id']}")
-            if status.get("state") in ("ready", "turn"):
+            if status.get("turn_until") or status.get("state") in ("ready", "turn", "your_turn", "claimable"):
                 break
             if status.get("state") in ("expired", "cancelled", "failed"):
                 raise RuntimeError(f"Chert queue {status.get('state')}")
             if status.get("position") is not None:
-                print(f"[chert] still queued at position {status.get('position')} ...")
+                print(f"[chert] still queued at position {status.get('position')} ...", file=sys.stderr, flush=True)
         else:
             raise RuntimeError("Chert queue wait timed out")
         # loop: re-POST with the same Idempotency-Key to claim our turn

@@ -44,6 +44,12 @@ GATE_LOG_EVERY_S = 5.0
 # returning "still working". Keep below the tool's response timeout in the
 # ElevenLabs dashboard.
 FIX_WAIT_S = float(os.getenv("MENTOR_FIX_WAIT_S") or "75")
+# send_to_grok returns at once (Mentor keeps talking while Grok works); the
+# result is pushed in when Mentor next pauses. Pause = no agent audio for this long.
+RESULT_PAUSE_S = float(os.getenv("MENTOR_RESULT_PAUSE_S") or "0.7")
+# After end_call, keep the line open this long once our audio queue is empty:
+# FaceTime plays ~1s behind what we send, so hanging up on drain clips the goodbye.
+GOODBYE_TAIL_S = float(os.getenv("MENTOR_GOODBYE_TAIL_S") or "1.6")
 
 _VALID = frozenset({"approve", "reject", "stop", "instruction"})
 
@@ -130,7 +136,7 @@ def mentor_prompt_with_context(packet: EscalationPacket) -> str:
     except OSError:
         logger.warning("mentor prompt missing at %s; using minimal prompt", _PROMPT_PATH)
         persona = (
-            "You are Mentor, a friendly ML engineer on a FaceTime call about a failed "
+            "You are Argos, a friendly ML engineer on a FaceTime call about a failed "
             "training run. Be brief and conversational. Use send_to_grok for decisions "
             "and end_call when the caller is done."
         )
@@ -315,6 +321,9 @@ class LiveKitAudioInterface:
             logger.exception("play_pcm from ElevenLabs failed")
 
     def interrupt(self) -> None:
+        q = getattr(self._room, "_audio_q", None)
+        queued_s = (q.qsize() * 0.02) if q is not None else 0.0
+        logger.info("ElevenLabs interruption: dropping %.1fs of queued Mentor audio", queued_s)
         self._room.clear_audio_queue()
 
     def push_user_pcm16_16k(self, pcm16k: bytes) -> None:
@@ -404,6 +413,7 @@ class ElevenAgentBridge:
         # Last successful approve result + the approval texts it covered.
         self._done_result: str = ""
         self._done_texts: list[str] = []
+        self._result_task: asyncio.Task | None = None
 
     @property
     def audio(self) -> LiveKitAudioInterface:
@@ -503,6 +513,9 @@ class ElevenAgentBridge:
             client_tools=client_tools,
             callback_agent_response=lambda t: logger.info("mentor: %s", t),
             callback_user_transcript=lambda t: logger.info("caller: %s", t),
+            callback_agent_response_correction=lambda orig, cut: logger.info(
+                "mentor (cut off by interruption): %s", cut
+            ),
             callback_disconnect=_on_disconnect,
         )
         self._agent_id = agent_id
@@ -552,6 +565,8 @@ class ElevenAgentBridge:
         self._room.set_user_audio_sink(None)
         if self._fix_future and not self._fix_future.done():
             self._fix_future.cancel()
+        if self._result_task and not self._result_task.done():
+            self._result_task.cancel()
         conv = self._conversation
         self._conversation = None
         self._started = False
@@ -596,6 +611,7 @@ class ElevenAgentBridge:
         deadline = time.monotonic() + 10.0
         while self._room.agent_speaking() and time.monotonic() < deadline:
             await asyncio.sleep(0.1)
+        await asyncio.sleep(GOODBYE_TAIL_S)
         from escalation_mcp.session import hangup_from_agent
 
         try:
@@ -687,28 +703,69 @@ class ElevenAgentBridge:
         if decision.decision == "stop":
             return "Recorded: Grok is stopping and reverting. Confirm briefly."
 
+        if pending and decision.decision == "approve":
+            return (
+                "Grok is already applying these fixes; nothing new was sent. Keep talking "
+                "with the caller meanwhile. Do not call send_to_grok again for them."
+            )
         fut = self._fix_future
         assert fut is not None
+        if self._result_task is None or self._result_task.done():
+            self._result_task = self._loop.create_task(self._deliver_result(fut, decision.decision, text))
+        # Return now so Mentor keeps the conversation going while Grok works
+        # (a blocking tool call = dead air). The result is pushed in later.
+        return (
+            "Grok has started (it takes about twenty seconds). Do NOT end the call and do "
+            "NOT announce a result yet. Keep the caller company in short turns: explain "
+            "why these exact changes (e.g. why point one is stable for plain SGD while "
+            "twenty overshoots; why a linear output can predict negative targets), what "
+            "they'll see on the loss window, and invite questions. End each turn with a "
+            "short question. A message starting with GROK UPDATE will arrive with the "
+            "real result."
+        )
+
+    async def _deliver_result(self, fut: "asyncio.Future[str]", decision: str, text: str | None) -> None:
+        """Wait for Grok's fix_done, then hand the result to Mentor as soon as it pauses."""
         try:
             result = await asyncio.wait_for(asyncio.shield(fut), timeout=FIX_WAIT_S)
+            done = True
         except asyncio.TimeoutError:
             logger.warning("send_to_grok: no fix_done after %.0fs", FIX_WAIT_S)
-            return (
-                "Grok is still applying the change. Tell the caller it's taking a few "
-                "more seconds; you'll get an update."
-            )
+            result, done = "Grok is still applying the change.", False
         except asyncio.CancelledError:
-            return "The call is ending."
+            return
         logger.info("send_to_grok result → %s", result[:160])
-        if decision.decision == "approve" and "Applied: yes" in result:
+        if done and decision == "approve" and "Applied: yes" in result:
             self._done_result = result
             self._done_texts.append((text or "").lower())
-        return (
-            f"{result} Now, in two or three sentences: what changed, the numbers from the "
-            "check, and that you're kicking off the full training run and will keep them "
-            "posted. Then say a short goodbye and call end_call (unless they just asked "
-            "something; answer it first)."
-        )
+        if done:
+            msg = (
+                f"GROK UPDATE (system message, not the caller): {result} Now, in two or "
+                "three sentences: what changed, the numbers from the check, and that you're "
+                "kicking off the full training run and will keep them posted. Then a short "
+                "goodbye and call end_call."
+            )
+        else:
+            msg = (
+                "GROK UPDATE (system message, not the caller): Grok is still working. Tell "
+                "the caller it needs a few more seconds; you'll get another update."
+            )
+        # Wait for Mentor to finish its current sentence so the update doesn't cut it off.
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            if self._stopping or self._conversation is None:
+                return
+            if not self._room.agent_speaking(tail_s=RESULT_PAUSE_S):
+                break
+            await asyncio.sleep(0.1)
+        conv = self._conversation
+        if conv is None:
+            return
+        try:
+            await asyncio.to_thread(conv.send_user_message, msg)
+            logger.info("GROK UPDATE delivered to Mentor (%s)", "result" if done else "still working")
+        except Exception:  # noqa: BLE001
+            logger.exception("delivering Grok result to Mentor failed")
 
     def _already_covered(self, text: str | None) -> bool:
         """True if an earlier approval (already applied) covers this one."""
