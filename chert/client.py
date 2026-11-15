@@ -81,17 +81,27 @@ def place_call(destination: str, participant_token: str, agent_identity: str = "
             QUEUE_FILE.unlink(missing_ok=True)
             return _get(f"/calls/{data['queue']['call_id']}")
 
-        q = data["queue"]
+        q = data.get("queue") if isinstance(data.get("queue"), dict) else {}
+        queue_id = data.get("queue_id") or q.get("id") or q.get("queue_id")
+        if not queue_id:
+            raise RuntimeError(f"Chert queue response missing id: {data!r}")
+
         QUEUE_FILE.parent.mkdir(exist_ok=True)
-        QUEUE_FILE.write_text(q["id"])
+        QUEUE_FILE.write_text(str(queue_id))
         print(f"[chert] line busy, queued at position {q.get('position')} ...")
         while time.time() < deadline:
             time.sleep(3)
-            q = _get(f"/calls/queue/{q['id']}")
-            if q.get("state") in ("ready", "turn"):
+            # Keep queue_id; status payloads often omit id after the first poll.
+            status = _get(f"/calls/queue/{queue_id}")
+            if status.get("call_id"):
+                QUEUE_FILE.unlink(missing_ok=True)
+                return _get(f"/calls/{status['call_id']}")
+            if status.get("state") in ("ready", "turn"):
                 break
-            if q.get("state") in ("expired", "cancelled", "failed"):
-                raise RuntimeError(f"Chert queue {q.get('state')}")
+            if status.get("state") in ("expired", "cancelled", "failed"):
+                raise RuntimeError(f"Chert queue {status.get('state')}")
+            if status.get("position") is not None:
+                print(f"[chert] still queued at position {status.get('position')} ...")
         else:
             raise RuntimeError("Chert queue wait timed out")
         # loop: re-POST with the same Idempotency-Key to claim our turn
