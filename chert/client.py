@@ -16,10 +16,19 @@ def _headers(idem: bool = False) -> dict:
     return h
 
 
+import time
+
+
+def _get(path: str) -> dict:
+    req = urllib.request.Request(f"{FACETIME_BASE}{path}", headers=_headers())
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())["data"]
+
+
 def place_call(destination: str, participant_token: str, agent_identity: str = "agent",
-               video: bool = True) -> dict:
+               video: bool = True, max_wait_s: float = 120) -> dict:
     is_phone = destination.startswith("+")
-    body = {
+    body = json.dumps({
         "direction": "outbound",
         "mode": "customer_managed",
         "line_id": os.environ["CHERT_LINE_ID"],
@@ -30,14 +39,33 @@ def place_call(destination: str, participant_token: str, agent_identity: str = "
         "participant_token": participant_token,
         "remote_participant_identity": agent_identity,
         "when_busy": "queue",
-    }
-    req = urllib.request.Request(f"{FACETIME_BASE}/calls", data=json.dumps(body).encode(),
-                                 method="POST", headers=_headers(idem=True))
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            return json.loads(r.read())["data"]
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Chert {e.code}: {e.read().decode()[:500]}") from None
+    }).encode()
+    headers = _headers(idem=True)  # SAME key reused across queue retries
+    deadline = time.time() + max_wait_s
+
+    while True:
+        req = urllib.request.Request(f"{FACETIME_BASE}/calls", data=body, method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.loads(r.read())["data"]
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"Chert {e.code}: {e.read().decode()[:500]}") from None
+
+        if not data.get("queued"):
+            return data  # real call: data["id"]
+
+        q = data["queue"]
+        print(f"[chert] line busy, queued at position {q.get('position')} ...")
+        while time.time() < deadline:
+            time.sleep(3)
+            q = _get(f"/calls/queue/{q['id']}")
+            if q.get("state") in ("ready", "turn"):
+                break
+            if q.get("state") in ("expired", "cancelled", "failed"):
+                raise RuntimeError(f"Chert queue {q.get('state')}")
+        else:
+            raise RuntimeError("Chert queue wait timed out")
+        # loop: re-POST with the same Idempotency-Key to claim our turn
 
 
 def end_call(call_id: str) -> None:
