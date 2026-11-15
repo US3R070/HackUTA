@@ -29,6 +29,10 @@ server = AgentServer()
 
 @server.rtc_session(agent_name="hackuta-mentor")
 async def mentor_session(ctx: JobContext) -> None:
+    # Job subprocesses need .env loaded again (parent env is not enough).
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
+    sync_env_aliases()
+
     session = build_session()
     await session.start(room=ctx.room, agent=Mentor())
     await session.generate_reply(instructions=greeting_instructions())
