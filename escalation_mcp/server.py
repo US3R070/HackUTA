@@ -32,11 +32,13 @@ async def escalate_failure(
     proposed_fix: str | None = None,
     run_id: str | None = None,
     share: str = "screen",
+    incident_id: str | None = None,
 ) -> dict[str, Any]:
     """Open an escalation: build packet, start screen share, notify cloud agent.
 
     Prefer share=\"window:<terminal or IDE title>\" for privacy. Use share=\"none\"
-    to skip screen share. If an escalation is already active, returns it.
+    to skip screen share. Pass incident_id to reuse a pre-minted id from a demo
+    script. If an escalation is already active, returns it.
     """
     return await sess.start_escalation(
         title=title,
@@ -47,6 +49,7 @@ async def escalate_failure(
         proposed_fix=proposed_fix,
         run_id=run_id,
         share=share,
+        incident_id=incident_id,
     )
 
 
@@ -68,9 +71,19 @@ async def get_human_response(
 ) -> dict[str, Any]:
     """Return the oldest unconsumed human decision. wait_seconds long-polls (max 25).
 
-    On decision=stop, subsequent calls keep returning stop until end_escalation.
+    When a real decision arrives (approve/reject/stop/instruction), the MCP
+    auto-resets: stops the :8765 preview, clears active state, frees the port
+    for the next escalate_failure. end_escalation stays safe/idempotent after that.
     """
-    return await STATE.get_human_response(incident_id, wait_seconds)
+    return await sess.poll_human_response(incident_id, wait_seconds)
+
+
+@mcp.tool()
+async def reset_escalation(incident_id: str | None = None) -> dict[str, Any]:
+    """Force-stop preview on :8765 and clear escalation state (manual cleanup)."""
+    return await sess.reset_runtime(
+        incident_id=incident_id, reason="manual_reset", save_report=False
+    )
 
 
 @mcp.tool()

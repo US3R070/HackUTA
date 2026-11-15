@@ -23,8 +23,8 @@ Do **not** escalate trivial errors you can fix safely yourself.
    - On `instruction`: follow it if safe; otherwise report why not via `report_action`.
 4. **Before any destructive or irreversible action**, call `get_human_response(wait_seconds=25)` in a loop until `approve` or `reject`. Never treat silence as approval.
 5. Use `set_screen_view` so the human sees what they need (traceback terminal, diff, rendered plot via `image:<path>`).
-6. Work on branch `agent/fix-<incident_id>`; never push or merge.
-7. Finish with `end_escalation` (`resolved` / `aborted` / `handed_off`).
+6. **Repo boundary:** training fixes belong in the **train** repo (`C:\Users\USER\HackUTA\train`), on branch `agent/fix-<incident_id>`. Never create training fix branches or commit train patches inside the HackUTA (`escalation_mcp`) repo. Never push or merge without approval.
+7. Finish with `end_escalation` (`resolved` / `aborted` / `handed_off`). A real `get_human_response` decision may auto-reset preview on `:8765`.
 
 Long commands: run them in the background and poll `get_human_response` — MCP cannot interrupt mid-command.
 

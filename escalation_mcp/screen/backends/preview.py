@@ -1,10 +1,16 @@
-"""Localhost MJPEG preview server (dev + LiveKit fallback)."""
+"""Localhost MJPEG preview server (dev + LiveKit fallback).
+
+Always binds the configured port (default 8765). Callers must tear down the
+previous preview before starting a new one — we do not hop to 8766+.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING
 
@@ -14,6 +20,26 @@ if TYPE_CHECKING:
     from escalation_mcp.screen.capture import CaptureLoop
 
 logger = logging.getLogger("escalation_mcp")
+
+
+def port_in_use(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.3)
+        try:
+            return sock.connect_ex((host, port)) == 0
+        except OSError:
+            return False
+
+
+async def wait_for_port_free(
+    host: str, port: int, *, timeout: float = 5.0, interval: float = 0.1
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not port_in_use(host, port):
+            return True
+        await asyncio.sleep(interval)
+    return not port_in_use(host, port)
 
 
 class PreviewBackend(ScreenBackend):
@@ -58,10 +84,9 @@ class PreviewBackend(ScreenBackend):
                                 )
                                 self.wfile.write(jpeg)
                                 self.wfile.write(b"\r\n")
-                            # Blocking sleep in handler thread is fine
-                            import time
+                            import time as _time
 
-                            time.sleep(0.2)
+                            _time.sleep(0.2)
                     except (BrokenPipeError, ConnectionResetError):
                         return
                 if self.path.startswith("/frame.jpg"):
@@ -77,28 +102,31 @@ class PreviewBackend(ScreenBackend):
                     self.send_response(200)
                     self.send_header("Content-Type", "image/jpeg")
                     self.send_header("Content-Length", str(len(jpeg)))
+                    self.send_header("Cache-Control", "no-cache")
                     self.end_headers()
                     self.wfile.write(jpeg)
                     return
                 self.send_response(404)
                 self.end_headers()
 
-        # Bind; if port busy, try a few next ports
-        bound = False
+        class _PreviewServer(ThreadingHTTPServer):
+            allow_reuse_address = True
+
         last_err: Exception | None = None
-        for offset in range(0, 10):
-            port = self.port + offset
+        for attempt in range(15):
             try:
-                self._httpd = ThreadingHTTPServer((self.host, port), Handler)
-                self.port = port
-                self.preview_url = f"http://{self.host}:{port}"
-                bound = True
+                self._httpd = _PreviewServer((self.host, self.port), Handler)
                 break
             except OSError as exc:
                 last_err = exc
-        if not bound or self._httpd is None:
-            raise RuntimeError(f"could not bind preview port: {last_err}")
+                await asyncio.sleep(0.15)
+        else:
+            raise RuntimeError(
+                f"could not bind preview to {self.host}:{self.port} "
+                f"(locked port; stop the previous preview first): {last_err}"
+            )
 
+        self.preview_url = f"http://{self.host}:{self.port}"
         self._thread = threading.Thread(
             target=self._httpd.serve_forever, name="mjpeg-preview", daemon=True
         )
@@ -107,10 +135,20 @@ class PreviewBackend(ScreenBackend):
 
     async def stop(self) -> None:
         if self._httpd is not None:
-            await asyncio.get_event_loop().run_in_executor(
-                None, self._httpd.shutdown
-            )
-            self._httpd.server_close()
+            httpd = self._httpd
             self._httpd = None
+
+            def _shutdown() -> None:
+                try:
+                    httpd.shutdown()
+                finally:
+                    try:
+                        httpd.server_close()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            await asyncio.get_event_loop().run_in_executor(None, _shutdown)
+            # Give Windows a moment to release TIME_WAIT listeners we own
+            await wait_for_port_free(self.host, self.port, timeout=3.0)
         self._thread = None
         self._capture = None

@@ -20,7 +20,10 @@ from escalation_mcp.packet import (
     save_packet,
 )
 from escalation_mcp.screen.backends.base import ScreenBackend
-from escalation_mcp.screen.backends.preview import PreviewBackend
+from escalation_mcp.screen.backends.preview import (
+    PreviewBackend,
+    wait_for_port_free,
+)
 from escalation_mcp.screen.capture import CaptureLoop, FrameSource, make_frame_source
 from escalation_mcp.screen.overlay import draw_overlay
 from escalation_mcp.sink.base import Sink
@@ -48,6 +51,8 @@ class RuntimeHandles:
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
     fake_frames: FrameSource | None = None  # injected in tests
     sharing: bool = False
+    # After a human decision is delivered, runtime auto-resets (preview killed).
+    auto_reset_on_decision: bool = True
 
 
 RUNTIME = RuntimeHandles(settings=Settings(), sink=MockSink(), channel=MockChannel())
@@ -108,6 +113,130 @@ async def _setup_logging(incident_id: str) -> None:
         root.addHandler(sh)
 
 
+async def _teardown_media() -> None:
+    """Stop capture/preview/LiveKit and free the locked preview port (8765)."""
+    port = RUNTIME.settings.preview_port
+    RUNTIME.stop_event.set()
+    if RUNTIME.capture_task:
+        try:
+            await asyncio.wait_for(RUNTIME.capture_task, timeout=2.0)
+        except Exception:  # noqa: BLE001
+            RUNTIME.capture_task.cancel()
+            try:
+                await RUNTIME.capture_task
+            except Exception:  # noqa: BLE001
+                pass
+        RUNTIME.capture_task = None
+
+    if RUNTIME.livekit_backend:
+        try:
+            await RUNTIME.livekit_backend.stop()
+        except Exception:  # noqa: BLE001
+            logger.exception("livekit backend stop failed")
+        RUNTIME.livekit_backend = None
+
+    if RUNTIME.preview:
+        try:
+            await RUNTIME.preview.stop()
+        except Exception:  # noqa: BLE001
+            logger.exception("preview stop failed")
+        RUNTIME.preview = None
+
+    if RUNTIME.room_conn:
+        try:
+            await RUNTIME.room_conn.disconnect()
+        except Exception:  # noqa: BLE001
+            logger.exception("room disconnect failed")
+        RUNTIME.room_conn = None
+
+    RUNTIME.capture = None
+    RUNTIME.stop_event = asyncio.Event()
+    freed = await wait_for_port_free("127.0.0.1", port, timeout=5.0)
+    if not freed:
+        logger.warning(
+            "preview port %s still busy after teardown; next escalate may fail to bind",
+            port,
+        )
+
+
+async def reset_runtime(
+    *,
+    incident_id: str | None = None,
+    reason: str = "reset",
+    save_report: bool = True,
+    outcome: str = "aborted",
+    summary: str | None = None,
+) -> dict[str, Any]:
+    """Fully reset escalation state and kill preview so :8765 can be reused."""
+    active = await STATE.get_active()
+    iid = incident_id or (active.incident_id if active else None)
+
+    if save_report and active and iid == active.incident_id:
+        report = FinalReport(
+            outcome=outcome,  # type: ignore[arg-type]
+            summary=summary or f"auto-reset after {reason}",
+            ended_at=_utc_now_iso(),
+            actions=[a.model_dump(by_alias=True) for a in active.actions],
+        )
+        try:
+            await RUNTIME.sink.send_report(iid, report)
+        except Exception:  # noqa: BLE001
+            logger.exception("reset report failed")
+
+    try:
+        await RUNTIME.channel.stop()
+    except Exception:  # noqa: BLE001
+        logger.exception("channel stop failed during reset")
+
+    await _teardown_media()
+
+    if iid:
+        await STATE.clear_active(iid)
+    elif active:
+        await STATE.clear_active(active.incident_id)
+
+    # Fresh mock channel for the next escalation in this MCP process
+    RUNTIME.channel = MockChannel()
+
+    if iid:
+        append_agent_log(
+            iid,
+            {"ts": _utc_now_iso(), "tool": "reset_runtime", "reason": reason},
+        )
+    logger.info("runtime reset (%s); preview port %s freed", reason, RUNTIME.settings.preview_port)
+    return {
+        "ok": True,
+        "reset": True,
+        "incident_id": iid,
+        "preview_port": RUNTIME.settings.preview_port,
+        "reason": reason,
+    }
+
+
+async def poll_human_response(incident_id: str, wait_seconds: int = 0) -> dict[str, Any]:
+    """get_human_response + auto-reset preview/state when a real decision arrives."""
+    result = await STATE.get_human_response(incident_id, wait_seconds)
+    if result.get("decision") == "none":
+        return result
+
+    if RUNTIME.auto_reset_on_decision:
+        outcome = {
+            "approve": "resolved",
+            "reject": "aborted",
+            "stop": "aborted",
+            "instruction": "handed_off",
+        }.get(str(result["decision"]), "aborted")
+        reset = await reset_runtime(
+            incident_id=incident_id,
+            reason=f"human_decision:{result['decision']}",
+            save_report=True,
+            outcome=outcome,
+            summary=f"human {result['decision']}: {result.get('text')}",
+        )
+        result = {**result, "reset": True, "preview_stopped": True, "reset_info": reset}
+    return result
+
+
 async def start_escalation(
     *,
     title: str,
@@ -118,16 +247,49 @@ async def start_escalation(
     proposed_fix: str | None = None,
     run_id: str | None = None,
     share: str = "screen",
+    incident_id: str | None = None,
 ) -> dict[str, Any]:
     existing = await STATE.get_active()
-    if existing:
+    capture_alive = bool(
+        RUNTIME.capture
+        and RUNTIME.capture_task
+        and not RUNTIME.capture_task.done()
+        and RUNTIME.capture._running  # noqa: SLF001
+    )
+    if existing and incident_id and existing.incident_id != incident_id:
+        logger.warning(
+            "replacing active escalation %s with requested %s",
+            existing.incident_id,
+            incident_id,
+        )
+        try:
+            await RUNTIME.channel.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        await _teardown_media()
+        await STATE.clear_active(existing.incident_id)
+        existing = None
+    elif existing and not capture_alive and share != "none":
+        logger.warning(
+            "active escalation %s has dead capture; restarting media",
+            existing.incident_id,
+        )
+        try:
+            await RUNTIME.channel.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        await _teardown_media()
+        await STATE.clear_active(existing.incident_id)
+        existing = None
+    elif existing:
         return {
             "incident_id": existing.incident_id,
             "status": "already_active",
             "room": existing.room,
             "preview_url": existing.preview_url,
             "sink": RUNTIME.sink.name,
-            "warnings": existing.warnings + ["escalation already active; returning existing"],
+            "warnings": existing.warnings
+            + ["escalation already active; returning existing"],
         }
 
     settings = RUNTIME.settings
@@ -135,7 +297,13 @@ async def start_escalation(
         # Validate live requirements now
         load_settings(require_live=True)
 
-    incident_id = new_incident_id()
+    # Always reclaim locked preview port before a new share
+    if RUNTIME.preview is not None or RUNTIME.capture is not None:
+        await _teardown_media()
+    else:
+        await wait_for_port_free("127.0.0.1", settings.preview_port, timeout=2.0)
+
+    incident_id = incident_id or new_incident_id()
     await _setup_logging(incident_id)
     room = f"esc-{incident_id}"
     warnings: list[str] = []
@@ -160,14 +328,14 @@ async def start_escalation(
         capture = CaptureLoop(frame_source, _overlay_fn, fps=settings.screen_fps)
         RUNTIME.capture = capture
 
-        preview = PreviewBackend(port=settings.preview_port)
+        preview = PreviewBackend(host="127.0.0.1", port=settings.preview_port)
         try:
             capture.capture_once()
             await preview.start(capture)
             RUNTIME.preview = preview
-            preview_url = preview.preview_url
+            preview_url = preview.preview_url  # always http://127.0.0.1:8765
         except Exception as exc:  # noqa: BLE001
-            warnings.append(f"preview failed: {exc}")
+            warnings.append(f"preview failed on locked port {settings.preview_port}: {exc}")
             logger.exception("preview start failed")
 
         RUNTIME.capture_task = asyncio.create_task(
@@ -331,7 +499,17 @@ async def end_escalation(
     outcome: str,
     summary: str,
 ) -> dict[str, Any]:
-    incident = STATE.require(incident_id)
+    active = await STATE.get_active()
+    if not active or active.incident_id != incident_id:
+        # Already auto-reset after a human decision — still free the port.
+        await reset_runtime(
+            incident_id=incident_id,
+            reason="end_escalation_idempotent",
+            save_report=False,
+        )
+        return {"ok": True, "already_reset": True}
+
+    incident = active
 
     # Final event
     seq = STATE.next_seq(incident)
@@ -349,53 +527,15 @@ async def end_escalation(
     except Exception:  # noqa: BLE001
         logger.exception("final event publish failed")
 
-    report = FinalReport(
-        outcome=outcome,  # type: ignore[arg-type]
+    reset = await reset_runtime(
+        incident_id=incident_id,
+        reason=f"end_escalation:{outcome}",
+        save_report=True,
+        outcome=outcome,
         summary=summary,
-        ended_at=_utc_now_iso(),
-        actions=[a.model_dump(by_alias=True) for a in incident.actions],
     )
-    await RUNTIME.sink.send_report(incident_id, report)
-
-    # Tear down screen / room
-    RUNTIME.stop_event.set()
-    if RUNTIME.capture_task:
-        try:
-            await asyncio.wait_for(RUNTIME.capture_task, timeout=2.0)
-        except Exception:  # noqa: BLE001
-            RUNTIME.capture_task.cancel()
-        RUNTIME.capture_task = None
-
-    if RUNTIME.livekit_backend:
-        try:
-            await RUNTIME.livekit_backend.stop()
-        except Exception:  # noqa: BLE001
-            logger.exception("livekit backend stop failed")
-        RUNTIME.livekit_backend = None
-
-    try:
-        await RUNTIME.channel.stop()
-    except Exception:  # noqa: BLE001
-        logger.exception("channel stop failed")
-
-    if RUNTIME.room_conn:
-        try:
-            await RUNTIME.room_conn.disconnect()
-        except Exception:  # noqa: BLE001
-            logger.exception("room disconnect failed")
-        RUNTIME.room_conn = None
-
-    if RUNTIME.preview:
-        try:
-            await RUNTIME.preview.stop()
-        except Exception:  # noqa: BLE001
-            logger.exception("preview stop failed")
-        RUNTIME.preview = None
-
-    RUNTIME.capture = None
-    await STATE.clear_active(incident_id)
     append_agent_log(
         incident_id,
         {"ts": _utc_now_iso(), "tool": "end_escalation", "outcome": outcome},
     )
-    return {"ok": True}
+    return {"ok": True, **reset}

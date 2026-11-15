@@ -225,8 +225,12 @@ class CaptureLoop:
         return framed
 
     async def run(self, stop_event) -> None:  # type: ignore[no-untyped-def]
+        """Async wrapper; real capture runs in a thread so MCP tool calls cannot freeze video."""
         import asyncio
 
+        await asyncio.to_thread(self.run_blocking, stop_event)
+
+    def run_blocking(self, stop_event) -> None:  # type: ignore[no-untyped-def]
         self._running = True
         interval = 1.0 / self.fps
         while not stop_event.is_set():
@@ -236,5 +240,6 @@ class CaptureLoop:
             except Exception:  # noqa: BLE001
                 logger.exception("capture frame failed")
             elapsed = time.monotonic() - t0
-            await asyncio.sleep(max(0.01, interval - elapsed))
+            # Event may be asyncio.Event — polling via is_set is enough; sleep in thread
+            time.sleep(max(0.01, interval - elapsed))
         self._running = False
