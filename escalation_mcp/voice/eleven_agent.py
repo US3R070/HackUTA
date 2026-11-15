@@ -75,7 +75,9 @@ def mentor_prompt_with_context(packet: EscalationPacket) -> str:
         "Be calm, brief, and concrete. Explain the problem in one or two sentences, "
         "ask if they want the proposed fix, and wait for a clear yes/no or instruction.\n"
         "When the human approves, rejects, asks to stop, or gives an instruction, "
-        "call the send_to_grok tool. Do not claim you edited code yourself.\n\n"
+        "call the send_to_grok tool. Do not claim you edited code yourself.\n"
+        "After send_to_grok succeeds: stay completely silent. Do not check if they are "
+        "still there, do not ask if they need anything else, do not say goodbye.\n\n"
         "INCIDENT CONTEXT:\n"
         f"{incident_context(packet)}"
     )
@@ -104,14 +106,21 @@ class LiveKitAudioInterface:
         self._out_hz = EL_SR
         self._silence_thread: threading.Thread | None = None
         self._bytes_out = 0
+        self._mute_agent_out = False
 
     def set_output_sample_rate(self, hz: int) -> None:
         if hz > 0:
             self._out_hz = hz
 
+    def mute_agent_output(self) -> None:
+        """Drop Mentor TTS chunks (used while we play our own filler)."""
+        self._mute_agent_out = True
+        self._room.clear_audio_queue()
+
     def start(self, input_callback: Callable[[bytes], None]) -> None:
         self._input_callback = input_callback
         self._running = True
+        self._mute_agent_out = False
         self._in_buf.clear()
         self._bytes_out = 0
         # Keep a silent uplink alive until FaceTime audio is subscribed.
@@ -122,6 +131,7 @@ class LiveKitAudioInterface:
 
     def stop(self) -> None:
         self._running = False
+        self._mute_agent_out = True
         self._input_callback = None
         with self._lock:
             self._in_buf.clear()
@@ -131,7 +141,7 @@ class LiveKitAudioInterface:
             t.join(timeout=1.0)
 
     def output(self, audio: bytes) -> None:
-        if not audio:
+        if not audio or not self._running or self._mute_agent_out:
             return
         self._bytes_out += len(audio)
         if self._bytes_out == len(audio):
@@ -286,7 +296,44 @@ class ElevenAgentBridge:
         except Exception:  # noqa: BLE001
             logger.debug("wait_for_session_end raised", exc_info=True)
 
-    async def _send_to_grok(self, parameters: dict) -> dict:
+    async def _park_conversation(self) -> None:
+        """Stop ConvAI so it can't fill silence with 'are you still there?'."""
+        self._room.set_user_audio_sink(None)
+        # Mute agent TTS immediately so late Mentor chunks can't talk over us.
+        self._audio.stop()
+        conv = self._conversation
+        self._conversation = None
+        self._started = False
+        if conv is None:
+            return
+        try:
+            await asyncio.to_thread(conv.end_session)
+        except Exception:  # noqa: BLE001
+            logger.debug("park end_session", exc_info=True)
+        try:
+            await asyncio.to_thread(conv.wait_for_session_end)
+        except Exception:  # noqa: BLE001
+            logger.debug("park wait_for_session_end", exc_info=True)
+
+    async def _thinking_filler_then_park(self) -> None:
+        """Human-sounding cover while Grok edits; then mute ConvAI."""
+        # Cut Mentor immediately so it can't ask "are you still there?" over us.
+        self._audio.mute_agent_output()
+        line = "Okay… on it. Give me a second while I apply that."
+        try:
+            from escalation_mcp.voice.tts import synthesize_pcm48
+
+            pcm = await asyncio.to_thread(synthesize_pcm48, line)
+            self._room.clear_audio_queue()
+            self._room.play_pcm(pcm)
+            # Let most of the line play before tearing down the agent socket.
+            await asyncio.sleep(min(3.5, max(1.2, len(pcm) / (48000 * 2) * 0.85)))
+        except Exception:  # noqa: BLE001
+            logger.exception("thinking filler TTS failed")
+        await self._park_conversation()
+        logger.info("Mentor ConvAI parked after approve (TTS owns the rest of the call)")
+
+    async def _send_to_grok(self, parameters: dict) -> str:
         raw = str(parameters.get("decision") or "").strip().lower()
         text = parameters.get("text")
         if isinstance(text, str):
@@ -294,10 +341,7 @@ class ElevenAgentBridge:
         else:
             text = None
         if raw not in _VALID:
-            return {
-                "ok": False,
-                "error": f"invalid decision {raw!r}; use approve|reject|stop|instruction",
-            }
+            return f"error: invalid decision {raw!r}; use approve|reject|stop|instruction"
         decision = HumanDecision.model_validate(
             {
                 "incident_id": self._packet.incident_id,
@@ -313,5 +357,20 @@ class ElevenAgentBridge:
             decision.decision,
             (decision.text or "")[:80],
         )
+        if decision.decision == "approve":
+            # Cover the edit gap + stop ConvAI idle prompts.
+            asyncio.create_task(
+                self._thinking_filler_then_park(), name="mentor-thinking-park"
+            )
+            return (
+                "queued decision=approve. "
+                "Say NOTHING else. Do not ask if the user is still there. Stay silent."
+            )
+        if decision.decision in ("reject", "stop"):
+            asyncio.create_task(self._park_conversation(), name="mentor-park")
+            return (
+                f"queued decision={decision.decision}. "
+                "Say NOTHING else. Stay silent."
+            )
         # ElevenLabs client_tool_result.result must be a string (dict → 1008 close).
         return f"queued decision={decision.decision}"

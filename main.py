@@ -6,11 +6,10 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
-from chert.notify import notify
-register(notify)
 
 import yaml
 
+from chert.notify import notify
 from incident.builder import build_incident
 from incident.models import Incident
 from incident.store import IncidentStore
@@ -24,6 +23,9 @@ HANDLERS: list[Callable[[Incident], None]] = []
 
 def register(handler: Callable[[Incident], None]) -> None:
     HANDLERS.append(handler)
+
+
+register(notify)
 
 
 def on_incident(inc: Incident) -> None:

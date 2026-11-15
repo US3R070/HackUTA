@@ -25,16 +25,19 @@ Do **not** escalate trivial errors you can fix safely yourself.
 2. Narrate with `report_action` **before and after every meaningful step** (read file, run command, edit, test).
 3. **Autonomous wait (required):** Right after `escalate_failure`, enter a loop and call `get_human_response(wait_seconds=25)` repeatedly until you get a real decision (`approve` / `reject` / `stop` / `instruction`). Do **not** stop and ask the TUI user what to do next — the human is on FaceTime; their yes/no arrives via this tool (from the Mentor voice bridge).
    - On `none`: loop again immediately.
-   - On `approve`: apply the proposed fix, `report_action` started/done, then **speak on the call** (see below), then `end_escalation`.
-   - On `reject`: do not edit; speak a short abort line; `end_escalation(outcome="aborted")`.
-   - On `stop`: halt, revert uncommitted edits from this incident, speak goodbye; `end_escalation(outcome="aborted")`.
+   - On `approve`: apply the proposed fix quickly, `report_action` started/done, then **speak on the call** (see below), then `end_escalation`.
+   - On `reject`: do not edit; one short abort line via `speak_to_caller`; `end_escalation(outcome="aborted")`.
+   - On `stop`: halt, revert uncommitted edits from this incident, one goodbye; `end_escalation(outcome="aborted")`.
    - On `instruction`: follow if safe; `report_action`; then keep looping for further decisions until approve/reject/stop.
 4. Never treat silence / `none` as approval.
 5. Use `set_screen_view` so the human sees what they need (traceback terminal, diff, rendered plot via `image:<path>`).
 6. **Repo boundary (this HackUTA demo):** config fixes may edit `demo/configs/*.yaml` in this repo. For a separate train repo, use branch `agent/fix-<incident_id>` there instead. Never push or merge without approval.
-7. **Call script (required when FaceTime is live):** after a successful fix, call `speak_to_caller` twice (wait `duration_s` from each result before the next step / hangup):
-   1. `"There we go — I fixed it for you. Is there anything else you'd like me to do?"`
-   2. Then call `get_human_response(wait_seconds=20)` once more for a possible follow-up instruction; if `none` / no more work, call `speak_to_caller` with a short goodbye (e.g. `"Alright, hanging up now. Good luck with the run."`), wait `duration_s`, then `end_escalation(outcome="resolved")`.
+7. **Call script (FaceTime live):** the voice bridge already plays a short “on it…” filler when approve is queued — do **not** add another thinking line.
+   After the fix:
+   1. `speak_to_caller`: `"Okay — it's fixed. Is there anything else you need?"` — wait `duration_s`
+   2. `get_human_response(wait_seconds=8)` **once only** — never poll again after this
+   3. On `none` / no / nothing else: `speak_to_caller` **once**: `"Sounds good. Hanging up — good luck with the run."` — wait `duration_s` — `end_escalation(outcome="resolved")` immediately
+   Never repeat the goodbye. Never ask “are you still there?” Never say hang-up twice.
 8. Only after `end_escalation` may you return control to the TUI user.
 
 Long commands: run them in the background and poll `get_human_response` — MCP cannot interrupt mid-command.
