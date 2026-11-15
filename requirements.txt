@@ -1,5 +1,6 @@
 pydantic>=2
 pyyaml
+python-dotenv
 google-genai
 xai-sdk
 fastapi
