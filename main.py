@@ -7,8 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 from chert.notify import notify
-register(notify)
-
+from chert.escalate import escalate, wait_forever
 import yaml
 
 from incident.builder import build_incident
@@ -25,7 +24,8 @@ HANDLERS: list[Callable[[Incident], None]] = []
 def register(handler: Callable[[Incident], None]) -> None:
     HANDLERS.append(handler)
 
-
+register(escalate)
+register(notify)
 def on_incident(inc: Incident) -> None:
     if not HANDLERS:
         print(f"\n=== INCIDENT {inc.id} ({inc.type}, {inc.triage.severity if inc.triage else '?'}) ===")
@@ -61,6 +61,10 @@ def main() -> None:
 
     code = Runner(cmd, run_dir, handle, detectors, log_tail_lines=cfg.get("log_tail_lines", 200)).run()
     print(f"[watcher] training exited with code {code}")
+
+    if HANDLERS:
+        print("[main] escalation active; Ctrl+C to end")
+        wait_forever()
 
 
 if __name__ == "__main__":
