@@ -27,6 +27,8 @@ class LiveKitScreenBackend(ScreenBackend):
         self._source: Any | None = None
         self._track: Any | None = None
         self._publication: Any | None = None
+        self._last_src: Any | None = None
+        self._last_bytes: bytes | None = None
         room_conn.add_bridge_joined_hook(self._on_subscriber_likely)
         room_conn.add_call_answered_hook(self._on_subscriber_likely)
 
@@ -89,12 +91,18 @@ class LiveKitScreenBackend(ScreenBackend):
 
         if not self._capture or self._capture.latest_rgba is None or not self._source:
             return
-        img = self._capture.latest_rgba.convert("RGBA").resize((W, H))
-        rgba = np.asarray(img, dtype=np.uint8)
-        bgra = np.ascontiguousarray(rgba[:, :, [2, 1, 0, 3]])
-        bgra[:, :, 3] = 255
+        latest = self._capture.latest_rgba
+        # Capture runs slower than the 20 fps push; only convert genuinely new
+        # frames (this loop shares the event loop with the audio pump).
+        if latest is not self._last_src or self._last_bytes is None:
+            img = latest.convert("RGBA").resize((W, H))
+            rgba = np.asarray(img, dtype=np.uint8)
+            bgra = np.ascontiguousarray(rgba[:, :, [2, 1, 0, 3]])
+            bgra[:, :, 3] = 255
+            self._last_bytes = bgra.tobytes()
+            self._last_src = latest
         self._source.capture_frame(
-            rtc.VideoFrame(W, H, rtc.VideoBufferType.BGRA, bgra.tobytes())
+            rtc.VideoFrame(W, H, rtc.VideoBufferType.BGRA, self._last_bytes)
         )
 
     async def _push_frames(self) -> None:

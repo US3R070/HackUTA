@@ -31,8 +31,8 @@ API = "https://api.elevenlabs.io"
 AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID") or os.getenv("AGENT_ID") or ""
 API_KEY = os.getenv("ELEVENLABS_API_KEY") or os.getenv("ELEVEN_API_KEY") or ""
 
-# Keep in sync with escalation_mcp/voice/eleven_agent.py FIX_WAIT_S (40s).
-SEND_TO_GROK_TIMEOUT_S = 45
+# Keep in sync with escalation_mcp/voice/eleven_agent.py FIX_WAIT_S (75s).
+SEND_TO_GROK_TIMEOUT_S = 80
 TURN_TIMEOUT_S = 20.0
 TEMPERATURE = 0.5
 
@@ -43,6 +43,23 @@ DECISION_DESCRIPTION = (
     "three instead', 'switch to AdamW'). Questions are NOT instructions ('should we use another "
     "optimizer?', 'why that number?') - answer those yourself without calling this tool."
 )
+
+# Client tools handled in escalation_mcp/voice/eleven_agent.py (code camera).
+CAMERA_TOOLS: dict[str, tuple[str, dict[str, str], list[str]]] = {
+    "show_code": (
+        "Zoom the caller's screen onto one highlighted line in their editor. Use when it "
+        "helps the explanation or when they ask to see code or config.",
+        {"query": "A 'path:line' from code_anchors in the incident context (e.g. "
+                  "'demo/train.py:165'), or a short exact code snippet like 'lr:'."},
+        ["query"],
+    ),
+    "show_full_screen": (
+        "Zoom the caller's screen back out to their whole screen.",
+        {"reason": "Optional short reason, e.g. 'done with code'."},
+        [],
+    ),
+}
+CAMERA_TOOL_TIMEOUT_S = 10
 
 AGENT_PATCH: dict[str, Any] = {
     "conversation_config": {
@@ -150,6 +167,30 @@ def _tool_id(agent: dict) -> str:
     raise SystemExit("send_to_grok tool not found on agent")
 
 
+def _client_tool_config(template: dict, name: str, description: str,
+                        props: dict[str, str], required: list[str]) -> dict:
+    """Build a client tool config using send_to_grok's config for field shapes."""
+    cfg = copy.deepcopy(template)
+    cfg.update(name=name, description=description, response_timeout_secs=CAMERA_TOOL_TIMEOUT_S)
+    params = copy.deepcopy(template.get("parameters") or {"type": "object"})
+    tprops = params.get("properties") or {}
+    base = copy.deepcopy(tprops.get("text") or next(iter(tprops.values()), {"type": "string"}))
+    base.pop("enum", None)
+    params["properties"] = {}
+    for pname, pdesc in props.items():
+        prop = copy.deepcopy(base)
+        prop.update(type="string", description=pdesc)
+        params["properties"][pname] = prop
+    params["required"] = required
+    cfg["parameters"] = params
+    return cfg
+
+
+def _agent_tool_names(agent: dict) -> set[str]:
+    tools = agent["conversation_config"]["agent"]["prompt"].get("tools") or []
+    return {t.get("name") for t in tools}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true")
@@ -178,7 +219,7 @@ def main() -> None:
                     "turn": backup["agent"]["conversation_config"]["turn"],
                     "agent": {"prompt": {
                         k: backup["agent"]["conversation_config"]["agent"]["prompt"][k]
-                        for k in ("temperature", "built_in_tools")
+                        for k in ("temperature", "built_in_tools", "tool_ids")
                     }},
                 },
                 "platform_settings": {"overrides": backup["agent"]["platform_settings"]["overrides"]},
@@ -190,14 +231,18 @@ def main() -> None:
 
     new_tool_cfg = copy.deepcopy(tool["tool_config"])
     new_tool_cfg["response_timeout_secs"] = SEND_TO_GROK_TIMEOUT_S
+    # Always speak before the tool runs: the agent narrates the fix while Grok works.
+    new_tool_cfg["force_pre_tool_speech"] = True
     props = new_tool_cfg.get("parameters", {}).get("properties", {})
     if "decision" in props:
         props["decision"]["description"] = DECISION_DESCRIPTION
 
     print("\nplanned:")
-    print(f"  send_to_grok timeout -> {SEND_TO_GROK_TIMEOUT_S}s; decision description tightened")
+    print(f"  send_to_grok timeout -> {SEND_TO_GROK_TIMEOUT_S}s; force pre-tool speech; decision description tightened")
     print(f"  turn_timeout -> {TURN_TIMEOUT_S}s; temperature -> {TEMPERATURE}")
     print("  end_call + skip_turn -> on; prompt + first_message overrides -> allowed")
+    missing_camera = [n for n in CAMERA_TOOLS if n not in _agent_tool_names(agent)]
+    print(f"  client tools to create + attach: {missing_camera or 'none (already on agent)'}")
     if not args.apply:
         print("\n(dry run; pass --apply to write)")
         return
@@ -208,7 +253,18 @@ def main() -> None:
     print(f"\nbackup: {backup_path.relative_to(ROOT)}")
 
     _req("PATCH", f"/v1/convai/tools/{tid}", {"tool_config": new_tool_cfg})
-    _req("PATCH", f"/v1/convai/agents/{AGENT_ID}{q}", AGENT_PATCH)
+
+    patch = copy.deepcopy(AGENT_PATCH)
+    if missing_camera:
+        tool_ids = list(agent["conversation_config"]["agent"]["prompt"].get("tool_ids") or [])
+        for name in missing_camera:
+            desc, props, required = CAMERA_TOOLS[name]
+            created = _req("POST", "/v1/convai/tools", {"tool_config": _client_tool_config(
+                new_tool_cfg, name, desc, props, required)})
+            print(f"created client tool {name}: {created.get('id')}")
+            tool_ids.append(created["id"])
+        patch["conversation_config"]["agent"]["prompt"]["tool_ids"] = tool_ids
+    _req("PATCH", f"/v1/convai/agents/{AGENT_ID}{q}", patch)
 
     agent_after = _req("GET", f"/v1/convai/agents/{AGENT_ID}")
     tool_after = _req("GET", f"/v1/convai/tools/{tid}")

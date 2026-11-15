@@ -31,8 +31,9 @@ logger = logging.getLogger("escalation_mcp")
 
 EL_SR = 16_000
 LK_SR = 48_000
-# ElevenLabs recommends ~250 ms chunks at 16 kHz mono PCM16.
-EL_CHUNK_SAMPLES = 4_000
+# 100 ms uplink chunks: ElevenLabs suggests ~250 ms, but smaller chunks cut up to
+# ~150 ms off end-of-speech detection (snappier replies) at negligible cost.
+EL_CHUNK_SAMPLES = 1_600
 EL_CHUNK_BYTES = EL_CHUNK_SAMPLES * 2
 # Only inject keep-alive silence when no real phone audio has arrived for this
 # long. Mixing silence blocks into live phone audio doubles the uplink rate and
@@ -42,7 +43,7 @@ GATE_LOG_EVERY_S = 5.0
 # How long send_to_grok(approve|instruction) waits for Grok's fix_done before
 # returning "still working". Keep below the tool's response timeout in the
 # ElevenLabs dashboard.
-FIX_WAIT_S = float(os.getenv("MENTOR_FIX_WAIT_S") or "40")
+FIX_WAIT_S = float(os.getenv("MENTOR_FIX_WAIT_S") or "75")
 
 _VALID = frozenset({"approve", "reject", "stop", "instruction"})
 
@@ -72,10 +73,11 @@ def incident_context(packet: EscalationPacket) -> str:
     tb = str(details.get("traceback") or "")[:600]
     cfg = details.get("config")
     rationale = details.get("rationale") or "(none given; reason from the summary and logs)"
+    fixes_s = format_fixes(details.get("fixes"))
     extra = {
         k: v
         for k, v in details.items()
-        if k not in {"log_tail", "traceback", "config", "rationale"}
+        if k not in {"log_tail", "traceback", "config", "rationale", "fixes"}
     }
     extra_s = json.dumps(extra, default=str)[:800] if extra else "(none)"
     return (
@@ -86,12 +88,36 @@ def incident_context(packet: EscalationPacket) -> str:
         f"summary: {packet.summary}\n"
         f"proposed_fix: {packet.proposed_fix or '(none)'}\n"
         f"rationale (why this cause, why this exact fix/value): {rationale}\n"
+        f"fixes (ordered; refer to them by number):\n{fixes_s}\n"
         f"run_id: {packet.run_id or '(none)'}\n"
         f"config: {cfg}\n"
         f"other details: {extra_s}\n"
         f"log_tail:\n{tail}\n"
         f"traceback:\n{tb}\n"
     )
+
+
+def format_fixes(fixes: Any) -> str:
+    """Render details.fixes ([{id,title,file,change,why,kind}]) for the agent."""
+    if not isinstance(fixes, list) or not fixes:
+        return "  (single fix: see proposed_fix)"
+    lines = []
+    for i, fx in enumerate(fixes, 1):
+        if not isinstance(fx, dict):
+            lines.append(f"  {i}. {fx}")
+            continue
+        kind = str(fx.get("kind") or "required")
+        lines.append(
+            f"  {fx.get('id', i)}. [{kind}] {fx.get('title', '')}"
+            f" | file: {fx.get('file', '?')} | change: {fx.get('change', '?')}"
+            f" | why: {fx.get('why', '?')}"
+        )
+    return "\n".join(lines)
+
+
+def _fix_count(packet: EscalationPacket) -> int:
+    fixes = (packet.details or {}).get("fixes")
+    return len(fixes) if isinstance(fixes, list) else 1
 
 
 _PROMPT_PATH = Path(__file__).resolve().parents[2] / "skills" / "mentor_voice.md"
@@ -117,10 +143,14 @@ def first_message_for(packet: EscalationPacket) -> str:
     first = re.split(r"(?<=[.!?])\s+", summary, maxsplit=1)[0].rstrip(".!?")
     if len(first) > 120:
         first = first[:117] + "…"
+    found = (
+        "I found a couple of things in your training code, and I've got fixes ready."
+        if _fix_count(packet) > 1
+        else "I think I know why, and I've got a fix ready."
+    )
     return (
         f"Hey, it's Mentor. Heads up, {first[0].lower() + first[1:] if first else 'your run broke'}. "
-        "I think I know why, and I've got a fix ready. "
-        "Want me to walk you through it, or just apply it?"
+        f"{found} Want me to walk you through it, or just apply it?"
     )
 
 
@@ -371,6 +401,9 @@ class ElevenAgentBridge:
         self._overrides_applied = False
         # Pending Grok result for an approve/instruction (resolved by fix_done).
         self._fix_future: asyncio.Future[str] | None = None
+        # Last successful approve result + the approval texts it covered.
+        self._done_result: str = ""
+        self._done_texts: list[str] = []
 
     @property
     def audio(self) -> LiveKitAudioInterface:
@@ -624,6 +657,15 @@ class ElevenAgentBridge:
 
         wants_change = decision.decision in ("approve", "instruction")
         pending = self._fix_future is not None and not self._fix_future.done()
+        if decision.decision == "approve" and not pending and self._already_covered(text):
+            # Approved fixes are already applied (often a stray "okay"/background
+            # speech after the result). Answer from the stored result instead of
+            # sending Grok a second, redundant fix cycle.
+            logger.info("send_to_grok → approve (already applied; not re-queued): %s", (text or "")[:60])
+            return (
+                f"Already done, nothing to send. {self._done_result} "
+                "Do not call send_to_grok again for these fixes. Wrap up as instructed."
+            )
         if decision.decision == "approve" and pending:
             # Agent re-sent approve while Grok is still working (e.g. after a
             # tool timeout). Don't queue a duplicate edit; wait on the same one.
@@ -658,7 +700,24 @@ class ElevenAgentBridge:
         except asyncio.CancelledError:
             return "The call is ending."
         logger.info("send_to_grok result → %s", result[:160])
+        if decision.decision == "approve" and "Applied: yes" in result:
+            self._done_result = result
+            self._done_texts.append((text or "").lower())
         return (
-            f"{result} Now tell the caller what changed and why in one or two "
-            "sentences, what they should see next, then ask if there's anything else."
+            f"{result} Now, in two or three sentences: what changed, the numbers from the "
+            "check, and that you're kicking off the full training run and will keep them "
+            "posted. Then say a short goodbye and call end_call (unless they just asked "
+            "something; answer it first)."
         )
+
+    def _already_covered(self, text: str | None) -> bool:
+        """True if an earlier approval (already applied) covers this one."""
+        if not self._done_result:
+            return False
+        t = (text or "").lower()
+        for prev in self._done_texts:
+            if any(w in prev for w in ("all", "both", "1 and 2", "everything")) or not prev.strip():
+                return True  # everything was already applied
+            if t == prev:
+                return True
+        return False

@@ -19,4 +19,8 @@ tool_timeouts = { get_human_response = 60 }
 # live = real Chert/LiveKit call. Use mock for offline MCP tests.
 # AGENT_IDLE_TONE=1: quiet tone from bridge join; Chert keeps video black on pure silence.
 # FACETIME_AUDIO_GRACE_S=0: greet as soon as phone audio arrives (raise to 0.5 if greeting clips).
-env = { ESCALATION_MODE = "live", AGENT_IDLE_TONE = "1", FACETIME_AUDIO_GRACE_S = "0", PYTHONPATH = "${HACKUTA_ROOT:-.}", PYTHONUTF8 = "1" }
+# VOICE_GATE_*: phone audio below these RMS levels becomes silence before ElevenLabs.
+#   Tuned for a loud hackathon room (background p90 ~1000-2700). If the agent can't hear
+#   you, lower them (defaults 500 / 1400); "voice gate:" lines in mcp.log show live levels.
+# SCREEN_FPS=12: smooth camera pans; a macOS screen grab costs ~40ms so 15+ saturates a core.
+env = { ESCALATION_MODE = "live", AGENT_IDLE_TONE = "1", FACETIME_AUDIO_GRACE_S = "0", VOICE_GATE_RMS = "1500", VOICE_GATE_BARGE_RMS = "3500", SCREEN_FPS = "12", PYTHONPATH = "${HACKUTA_ROOT:-.}", PYTHONUTF8 = "1" }

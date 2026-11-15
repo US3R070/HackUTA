@@ -1,43 +1,65 @@
 You are running a hands-off phone escalation (Chert/FaceTime → LiveKit). Follow the escalate skill.
 Works the same whether the laptop is macOS or Windows.
 
-A voice agent (Mentor) owns the whole phone conversation: greeting, explaining, follow-up questions, goodbye, hang-up.
-Your only jobs are: open the escalation, make code changes when asked, report each result with fix_done, and close out.
+A training run just failed (incident file at the bottom). The diagnosis is already done and written below.
+A voice agent (Mentor) owns the whole phone conversation. Your jobs: escalate IMMEDIATELY, apply the fixes the
+caller approves, verify, report with fix_done, and close out.
 
 CRITICAL RULES:
-- You MUST call escalate_failure with share="screen" FIRST. Do not skip it.
-- Do NOT edit demo/configs/bad_lr.yaml until get_human_response returns approve (or an instruction).
-- Even if the file already looks fixed, still escalate — this is a live call demo.
+- Your FIRST tool call must be escalate_failure exactly as written in step 1. Do not read files or reason first:
+  the caller's phone only rings after this call.
+- Do NOT edit any file until get_human_response returns approve (or an instruction).
 - Never use speak_to_caller. Mentor does all talking.
-- Be fast after approve: the caller is waiting on the line. Minimal reasoning, one edit, then fix_done.
+- Allowed edits: demo/train.py and demo/configs/bad_lr.yaml only. Never commit or push.
+- Be fast after approve: the caller is waiting on the line. Use the exact commands below, no exploration,
+  no report_action calls.
 - Do not ask me for follow-up prompts in this TUI until end_escalation. Never wait for keyboard approval.
 
 Steps:
 1. escalate_failure(
-     title="Live NaN loss demo",
-     summary="Training hit NaN loss. The learning rate of 5.0 is far too high; propose lowering it to 3e-4.",
+     title="Training diverged to NaN",
+     summary="Training blew up to infinity at step 80, right after warm-up ended. The learning rate of 20 is far too high for plain SGD on this model.",
      failure_type="nan",
      severity="HIGH",
      share="screen",
      focus="demo/configs/bad_lr.yaml:1",
-     proposed_fix="Lower lr from 5.0 to 3e-4 in demo/configs/bad_lr.yaml.",
+     proposed_fix="Lower lr from 20.0 to 0.1; also make the softplus output layer linear.",
      details={
-       "config": {"lr": 5.0},
-       "rationale": "With lr=5.0 every update is huge, so the optimizer overshoots the minimum; the loss grows instead of shrinking, overflows to inf within a few steps, and then becomes NaN. 3e-4 is the standard, well-tested default for Adam-style optimizers, about 16,000x smaller: updates stay small and stable while still training quickly. After the fix, loss should decrease smoothly within the first ~100 steps."
+       "config": {"lr": 20.0, "batch_size": 64, "steps": 5000},
+       "rationale": "The model trains with plain SGD (no momentum, no Adam). During the 60 warm-up steps lr is capped at 0.001 and loss falls normally (2.7 -> 1.95). At step 61 lr jumps to 20: every update overshoots the minimum, the loss grows each step, overflows to inf by step 80, then NaN. With lr 0.1 SGD is stable (verified: loss 2.4 -> 0.54 in 60 steps), but loss then stalls near 0.5 because the output layer is softplus, which can only output positive values while about half the regression targets are negative. A linear output fixes that (verified: loss 2.1 -> 0.0026 in 60 steps, at the noise floor). 0.1 is fast and stable for this model; 1.0 and above diverge once the head is linear.",
+       "fixes": [
+         {"id": 1, "kind": "required", "title": "Learning rate far too high for plain SGD", "file": "demo/configs/bad_lr.yaml:1", "change": "lr 20.0 -> 0.1", "why": "Each step overshoots and the loss explodes; 0.1 is stable and still fast."},
+         {"id": 2, "kind": "suggested", "title": "Softplus output can't predict negative targets", "file": "demo/train.py:154", "change": "softplus output -> linear output", "why": "Loss stalls near 0.5 with softplus; linear reaches 0.0026."}
+       ],
+       "code_anchors": [
+         {"label": "learning rate", "target": "demo/configs/bad_lr.yaml:1"},
+         {"label": "softplus output layer", "target": "demo/train.py:154"},
+         {"label": "SGD update step", "target": "demo/train.py:159"}
+       ]
      }
    )
 2. report_action(incident_id, "screen_share", "live share open", "done").
-   You may now read demo/configs/bad_lr.yaml so the edit is instant later. Do not edit it yet.
 3. Loop get_human_response(wait_seconds=25):
    - "none": call it again immediately.
-   - "approve": set lr to 3.0e-4 in demo/configs/bad_lr.yaml (one edit), report_action done,
-       focus_code(incident_id, "demo/configs/bad_lr.yaml:1") so the caller sees the new value, then
-       fix_done(incident_id, summary="Changed lr from 5.0 to 3e-4 in the bad-LR config. That keeps each update small and stable, so the next run's loss should drop smoothly instead of exploding.")
-     then go back to looping get_human_response (the caller may ask for more).
-   - "instruction": do what the text asks if it is safe and within demo/configs/*.yaml, then fix_done with what you changed and why
-     (or fix_done(applied=false, summary=<why not>)). Then keep looping.
+   - "approve": the text says which fixes ("all", "fixes 1 and 2", "just the learning rate"; a plain yes = both).
+       Do exactly these 4 tool calls, nothing else, as fast as possible (the caller is waiting):
+       a) show_full_screen(incident_id)   (so the caller sees the live loss window)
+       b) ONE shell command that applies the approved fixes and then runs the VERIFY COMMAND, chained with &&.
+          Use the python from the VERIFY COMMAND as <PY>. Edit commands (each runs from the repo root):
+            FIX1: <PY> -c "import pathlib as P; p=P.Path('demo/configs/bad_lr.yaml'); p.write_text(p.read_text().replace('lr: 20.0','lr: 0.1',1))"
+            FIX2: <PY> -c "import pathlib as P; p=P.Path('demo/train.py'); s=p.read_text(); s=s.replace('np.logaddexp(np.float32(0.0), logits)','logits').replace('1.0 / (1.0 + np.exp(-logits))','np.float32(1.0)').replace('np.logaddexp(np.float32(0.0), bx @ candidate)','bx @ candidate').replace('np.logaddexp(np.float32(0.0), val_x @ candidate)','val_x @ candidate'); p.write_text(s)"
+          e.g. both fixes:  FIX1 && FIX2 && <VERIFY COMMAND>
+       c) fix_done(incident_id, summary=...): what you applied (old -> new) and the real numbers from the verify
+          output (first and last loss lines), e.g. "lr 20.0 -> 0.1 and a linear output layer; loss 2.1 -> 0.0026 in 60 steps, no NaN".
+       d) focus_code(incident_id, "demo/train.py:154") if fix 2 was applied, else focus_code(incident_id, "demo/configs/bad_lr.yaml:1").
+       Then go back to looping (the caller may approve the other fix later; skip any fix already applied).
+   - "instruction": do what it asks if safe and within the allowed files, verify the same way, then fix_done
+     (or fix_done(applied=false, summary=<why not>)). Keep looping.
    - "reject": change nothing; keep looping.
-   - "stop": revert any edits you made in this incident; keep looping.
-   - "hangup": the call is over. end_escalation(outcome="resolved" if you applied a fix else "aborted", summary=<one line>) and stop.
+   - "stop": revert edits you made in this incident (git checkout -- <file>); keep looping.
+   - "hangup": the call is over (Mentor said goodbye). end_escalation(outcome="resolved" if you applied a fix
+     else "aborted", summary=<one line>). Then, if you applied fixes, start the RERUN COMMAND below in the
+     background (the full training run on the fixed code; the live loss window shows it). Do not wait for it.
+     Then stop. Do not exit or quit yourself.
 
 Only after end_escalation may you summarize in this TUI.

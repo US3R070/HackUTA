@@ -19,7 +19,7 @@ KILL_ON = {"nan", "oom"}  # stop wasting compute on these
 class Runner:
     def __init__(self, cmd: list[str], run_dir: str | Path, on_failure: OnFailure,
                  detectors: Optional[Detectors] = None, log_tail_lines: int = 200,
-                 poll_s: float = 0.5, cwd: str | Path | None = None):
+                 poll_s: float = 0.5, cwd: str | Path | None = None, echo: bool = False):
         self.cmd = cmd
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -29,6 +29,7 @@ class Runner:
         self.log_tail: deque[str] = deque(maxlen=log_tail_lines)
         self.poll_s = poll_s
         self.cwd = cwd
+        self.echo = echo  # mirror training output to our stdout (live demo view)
         self.proc: Optional[subprocess.Popen] = None
         self.detections: list[Detection] = []
         self._lock = threading.Lock()
@@ -54,6 +55,8 @@ class Runner:
                 self.log_tail.append(line)
                 log_file.write(line + "\n")
                 log_file.flush()
+                if self.echo:
+                    print(line, flush=True)
                 self._handle(self.det.feed_line(line))
 
     def run(self) -> int:

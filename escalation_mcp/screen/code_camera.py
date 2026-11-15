@@ -68,6 +68,9 @@ class CameraConfig:
             zoom=_f("CODE_CAMERA_ZOOM", 1.8),
             font_size=int(_f("CODE_CAMERA_FONT_SIZE", 18)),
             color=os.getenv("CODE_CAMERA_COLOR") or "#5c4400",
+            # First jump also waits for VS Code to apply the highlight settings
+            # (~3-4s measured on macOS), so allow more than the 2.5s default.
+            jump_grace_s=_f("CODE_CAMERA_JUMP_GRACE_S", 5.0),
         )
 
 
@@ -221,8 +224,18 @@ def make_dpi_aware() -> None:
             pass
 
 
+# macOS: no per-window lookup (would need Quartz + Screen Recording permission for
+# window titles). Treat the whole captured frame as the search area instead; the
+# cursor-line color is unique to the camera, so false matches are unlikely. The
+# trade-off: the "covered by another window" check is skipped on macOS.
+_MAC_WHOLE_SCREEN_ID = 1
+_MAC_WHOLE_SCREEN = (_MAC_WHOLE_SCREEN_ID, (-(10**7), -(10**7), 10**7, 10**7))
+
+
 def find_vscode_window() -> tuple[int, tuple[int, int, int, int]] | None:
     """(hwnd, (left, top, right, bottom)) of the largest visible VS Code window."""
+    if sys.platform == "darwin":
+        return _MAC_WHOLE_SCREEN
     if sys.platform != "win32":
         return None
     try:
@@ -243,6 +256,8 @@ def find_vscode_window() -> tuple[int, tuple[int, int, int, int]] | None:
 
 def top_window_at(x: int, y: int) -> int:
     """Root hwnd of whatever is actually visible at screen point (x, y)."""
+    if sys.platform == "darwin":
+        return _MAC_WHOLE_SCREEN_ID
     if sys.platform != "win32":
         return 0
     import ctypes
@@ -257,6 +272,27 @@ def top_window_at(x: int, y: int) -> int:
     return int(root or 0)
 
 
+def find_code_cli() -> str | None:
+    """VS Code's `code` CLI: PATH first, then (macOS) inside the app bundle wherever it lives."""
+    cli = shutil.which("code") or shutil.which("code.cmd")
+    if cli or sys.platform != "darwin":
+        return cli
+    rel = "Contents/Resources/app/bin/code"
+    candidates = [Path("/Applications/Visual Studio Code.app"), Path.home() / "Applications/Visual Studio Code.app"]
+    try:
+        found = subprocess.run(
+            ["mdfind", "kMDItemCFBundleIdentifier == 'com.microsoft.VSCode'"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout.split("\n")
+        candidates += [Path(p) for p in found if p.strip()]
+    except Exception:  # noqa: BLE001
+        pass
+    for app in candidates:
+        if (app / rel).is_file():
+            return str(app / rel)
+    return None
+
+
 # ---------------------------------------------------------------- detection
 
 def hex_rgb(color: str) -> tuple[int, int, int]:
@@ -264,12 +300,26 @@ def hex_rgb(color: str) -> tuple[int, int, int]:
     return int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
 
 
+# macOS color-manages app windows, so the marker renders a few values off the
+# configured hex in screenshots (e.g. #5c4400 -> (89, 69, 18)). Windows is exact.
+COLOR_TOL = int(os.getenv("CODE_CAMERA_COLOR_TOL") or (0 if sys.platform == "win32" else 24))
+
+
+def _color_mask(px: np.ndarray, r: int, g: int, b: int, tol: int) -> np.ndarray:
+    if tol <= 0:
+        return (px[..., 2] == r) & (px[..., 1] == g) & (px[..., 0] == b)
+    p = px[..., :3].astype(np.int16)
+    return ((np.abs(p[..., 2] - r) <= tol) & (np.abs(p[..., 1] - g) <= tol)
+            & (np.abs(p[..., 0] - b) <= tol))
+
+
 def find_line(bgr: np.ndarray, rgb: tuple[int, int, int], step: int = 4,
-              min_px: int = 150) -> tuple[int, int, int, int] | None:
-    """Exact-color band on a raw BGR(A) frame -> (x0, y0, x1, y1) or None."""
+              min_px: int = 150, tol: int | None = None) -> tuple[int, int, int, int] | None:
+    """Marker-color band on a raw BGR(A) frame -> (x0, y0, x1, y1) or None."""
     r, g, b = rgb
+    tol = COLOR_TOL if tol is None else tol
     sub = bgr[:, ::step]
-    mask = (sub[..., 2] == r) & (sub[..., 1] == g) & (sub[..., 0] == b)
+    mask = _color_mask(sub, r, g, b, tol)
     counts = mask.sum(axis=1)
     rows = np.flatnonzero(counts >= max(4, min_px // step))
     if rows.size == 0:
@@ -278,7 +328,7 @@ def find_line(bgr: np.ndarray, rgb: tuple[int, int, int], step: int = 4,
     best = max(runs, key=lambda rr: counts[rr].sum())
     y0, y1 = int(best.min()), int(best.max()) + 1
     band = bgr[y0:y1]
-    full = (band[..., 2] == r) & (band[..., 1] == g) & (band[..., 0] == b)
+    full = _color_mask(band, r, g, b, tol)
     cols = np.flatnonzero(full.any(axis=0))
     return int(cols.min()), y0, int(cols.max()) + 1, y1
 
@@ -370,9 +420,12 @@ class CodeCameraSource:
             with (mss.MSS() if hasattr(mss, "MSS") else mss.mss()) as sct:
                 monitors = sct.monitors
                 mon = monitors[min(max(monitor_index, 1), len(monitors) - 1)]
+                # Size the camera in captured pixels: on a Retina Mac mss reports the
+                # monitor in points but grabs 2x pixels (on Windows they match).
+                probe = sct.grab(mon)
             self._mon = mon
             self._grab_raw = self._grab_mss
-            screen_size = (mon["width"], mon["height"])
+            screen_size = (probe.width, probe.height)
             screen_origin = (mon["left"], mon["top"])
         else:
             self._grab_raw = grab_raw
@@ -502,7 +555,7 @@ class CodeCameraSource:
         target, others = resolve(query, self.config.workspace)
         if target is None:
             return {"ok": False, "error": f"nothing matches {query!r}"}
-        cli = self._code_cli or shutil.which("code") or shutil.which("code.cmd")
+        cli = self._code_cli or find_code_cli()
         if not cli:
             return {"ok": False, "error": "VS Code CLI `code` not found on PATH"}
         self.patch.apply()

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Small, real float32 regression demo; no downloads, GPU, or API keys needed.
+"""Small float32 regression trainer; no downloads, GPU, or API keys needed.
 
 Run from the repository root. See script.md for watcher/fixer integration.
-The warm-up and sleep are deliberate presentation controls, not fake losses.
+--warmup-steps and --step-delay control pacing; losses are always real.
 """
 import argparse
 import json
@@ -77,9 +77,6 @@ def main():
         raise ValueError('Run already exists: choose a fresh --run-dir or use --resume')
 
     # Appending a constant feature is equivalent to a trainable bias.
-    # The softplus output is a poor fit for regression targets that can be
-    # negative, and the update below intentionally uses the ascent direction.
-    # This creates a reproducible code-level failure for the watcher demo.
     seed = args.seed
     weights = np.zeros((9, 1), dtype=np.float32)
     start_step = 0
@@ -140,15 +137,13 @@ def main():
             metrics.write(json.dumps(row, allow_nan=False) + '\n')
 
         say(f'START attempt={attempt} step={start_step} configured_lr={config["lr"]}')
-        say(f'DEMO warmup={args.warmup_steps} steps; delay={args.step_delay}s/step')
+        say(f'warmup={args.warmup_steps} steps; delay={args.step_delay}s/step')
         status('running', start_step)
         try:
             for step in range(start_step + 1, stop_step + 1):
                 time.sleep(args.step_delay)
-                # Optional warm-up is available for longer rehearsals. By
-                # default, use the configured learning rate immediately so
-                # this intentionally unstable model fails within a minute.
-                # On resume, use the NEW config immediately, without warm-up.
+                # Optional warm-up uses a small learning rate for the first steps.
+                # On resume, use the new config immediately, without warm-up.
                 lr = min(config['lr'], 0.001) if not args.resume and step <= args.warmup_steps else config['lr']
                 # Step-derived batches make replay independent of process RNG state.
                 batch_rng = np.random.default_rng(seed + step)
@@ -160,9 +155,8 @@ def main():
                     output_gradient = 1.0 / (1.0 + np.exp(-logits))
                     error = prediction - by
                     gradient = (np.float32(2.0 / len(bx)) * bx.T) @ (error * output_gradient)
-                    # Deliberately bad optimizer direction: this adds the
-                    # loss gradient, so high loss grows until float32 fails.
-                    candidate = weights + np.float32(lr) * gradient
+                    # Plain SGD step.
+                    candidate = weights - np.float32(lr) * gradient
                     train_prediction = np.logaddexp(np.float32(0.0), bx @ candidate)
                     val_prediction = np.logaddexp(np.float32(0.0), val_x @ candidate)
                     loss = float(np.mean((train_prediction - by) ** 2))
