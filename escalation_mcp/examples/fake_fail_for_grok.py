@@ -143,12 +143,13 @@ def _prompt(incident_id: str) -> str:
            Before any file edit / resume, long-poll
            get_human_response(incident_id="{incident_id}", wait_seconds=25)
            until approve or reject. Never treat silence as approval.
-           When a real decision arrives, the MCP auto-resets and frees
-           http://127.0.0.1:8765 for the next run (preview stops).
+           The call stays live after a decision so the human can keep
+           watching; keep polling. decision="hangup" means the call ended
+           (if run_default_action is true, do default_action).
         6. Preview URL is always http://127.0.0.1:8765.
            After approve you may draft on branch agent/fix-{incident_id}
-           (do not push/merge). Calling end_escalation is optional if reset
-           already happened; it is idempotent.
+           (do not push/merge). Finish with end_escalation; it keeps the
+           monitor up for a short grace if the human is still watching.
         """
     ).strip()
 
@@ -171,8 +172,8 @@ def main() -> int:
     print("=" * 60)
     print()
     print("Preview is locked to http://127.0.0.1:8765")
-    print("After simulate approve/reject/stop, Grok's next get_human_response")
-    print("auto-resets state and frees :8765 for the next test.")
+    print("After simulate approve, the preview keeps streaming (call_state=watching).")
+    print("End the call with: simulate <id> hangup  (or leave / wait for the idle timer).")
     print("Manual cleanup tool if stuck: reset_escalation")
     print()
     print("STEP 1 — start local Grok in this repo:")

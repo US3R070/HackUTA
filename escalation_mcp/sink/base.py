@@ -22,3 +22,15 @@ class Sink(ABC):
     async def send_event(self, incident_id: str, event: dict[str, Any]) -> list[str]:
         """Optional HTTP event mirror. Default: no-op."""
         return []
+
+    def places_call(self, packet: EscalationPacket) -> bool:
+        """Whether sending this packet results in a phone call we should track."""
+        return True
+
+    async def redial(self, packet: EscalationPacket, attempt: int) -> list[str]:
+        """Nobody answered: place the call again. Default: no-op."""
+        return []
+
+    async def end_call(self, incident_id: str) -> list[str]:
+        """Hang up the phone side of the call. Default: no-op."""
+        return []

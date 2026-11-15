@@ -16,6 +16,7 @@ from escalation_mcp.config import Settings
 logger = logging.getLogger("escalation_mcp")
 
 DataHandler = Callable[[bytes, Optional[str]], Awaitable[None]]
+PresenceHandler = Callable[[str], Awaitable[None]]
 
 SCREEN_IDENTITY = "agent"          # Chert's remote_participant_identity
 BRIDGE_IDENTITY = "chert-bridge"   # identity we give Chert's bridge token
@@ -74,6 +75,7 @@ class LiveKitRoomConnection:
         self.settings = settings
         self.room: Any | None = None
         self._handlers: list[DataHandler] = []
+        self._presence_handlers: list[PresenceHandler] = []
         self._connected = False
         self._audio_source: Any | None = None
         self._audio_q: asyncio.Queue[bytes] = asyncio.Queue()
@@ -91,6 +93,21 @@ class LiveKitRoomConnection:
     def remove_data_handler(self, handler: DataHandler) -> None:
         if handler in self._handlers:
             self._handlers.remove(handler)
+
+    def add_presence_handler(self, handler: PresenceHandler) -> None:
+        if handler not in self._presence_handlers:
+            self._presence_handlers.append(handler)
+
+    def remove_presence_handler(self, handler: PresenceHandler) -> None:
+        if handler in self._presence_handlers:
+            self._presence_handlers.remove(handler)
+
+    def _fire_presence(self, event: str) -> None:
+        for handler in list(self._presence_handlers):
+            try:
+                asyncio.create_task(handler(event))
+            except Exception:  # noqa: BLE001
+                logger.exception("presence handler error")
 
     # ---- audio ----
     def play_pcm(self, pcm: bytes) -> None:
@@ -139,6 +156,14 @@ class LiveKitRoomConnection:
                 logger.info("Chert bridge joined; playing chime to wake video")
                 self.bridge_joined.set()
                 self.play_pcm(CHIME)  # later: greeting TTS instead
+                self._fire_presence("joined")
+
+        @self.room.on("participant_disconnected")
+        def _on_participant_left(p: Any) -> None:
+            if getattr(p, "identity", "") == BRIDGE_IDENTITY:
+                logger.info("Chert bridge left the room (caller hung up?)")
+                self.bridge_joined.clear()
+                self._fire_presence("left")
 
         await self.room.connect(self.settings.livekit_url, token)
         self._connected = True
@@ -176,3 +201,4 @@ class LiveKitRoomConnection:
         self.room = None
         self._audio_source = None
         self._handlers.clear()
+        self._presence_handlers.clear()

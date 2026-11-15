@@ -59,4 +59,7 @@ def wait_forever() -> None:
         threading.Event().wait()
     except KeyboardInterrupt:
         for eid in ACTIVE.values():
-            asyncio.run_coroutine_threadsafe(sess.end_escalation(eid, "aborted", "operator exit"), _loop).result(10)
+            # hang_up_now: skip the watch grace, the process is about to exit
+            asyncio.run_coroutine_threadsafe(
+                sess.end_escalation(eid, "aborted", "operator exit", hang_up_now=True), _loop
+            ).result(10)
