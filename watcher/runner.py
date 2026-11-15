@@ -208,7 +208,10 @@ def watch(command, run_dir, cwd=None, config=None, poll=0.1, plateau_steps=0, mi
             read_metrics()  # Catch metrics flushed just before process exit.
             code = process.wait()
             if code != 0 and not interrupted:
-                detect('crash', f'Training exited with code {code}')
+                # The demo emits exit code 2 specifically for non-finite
+                # training state. Keep that signal in the same incident as a
+                # metric/log detection rather than downgrading it to a crash.
+                detect('nan' if code == 2 else 'crash', f'Training exited with code {code}')
             
             if incident:
                 incident['process_exit_code'] = code

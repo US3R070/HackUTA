@@ -8,17 +8,26 @@ class MetricsTail:
     def __init__(self, path, start_at_end=False):
         self.path = Path(path)
         self.offset = self.path.stat().st_size if start_at_end and self.path.exists() else 0
+        self.identity = self._identity() if self.path.exists() else None
         self.pending = b''
         self.errors = []
+
+
+    def _identity(self):
+        stat = self.path.stat()
+        return stat.st_dev, stat.st_ino
 
 
     def read(self):
         self.errors = []
         try:
             with self.path.open('rb') as stream:
-                if self.path.stat().st_size < self.offset:
+                stat = self.path.stat()
+                identity = (stat.st_dev, stat.st_ino)
+                if identity != self.identity or stat.st_size < self.offset:
                     self.offset = 0
                     self.pending = b''
+                self.identity = identity
                 stream.seek(self.offset)
                 chunk = stream.read()
                 self.offset = stream.tell()

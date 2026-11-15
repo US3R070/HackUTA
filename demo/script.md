@@ -15,17 +15,41 @@ the other modules in the spec. This script does not implement or simulate them.
 ## Setup and rehearsal
 
 Run these commands from the repository root (the folder containing `demo/`).
-They work in PowerShell and Bash. Use Python 3.10 or later.
+On Windows, use Python 3.12 for this demo. The project also uses LiveKit's
+Google plugin, which requires NumPy below 2; Python 3.12 has compatible NumPy
+1.x wheels. Use the same virtual-environment interpreter for the watcher and
+its training subprocess.
 
-```bash
-python -m pip install numpy PyYAML
-python -u demo/train.py --config demo/configs/bad_lr.yaml --run-dir runs/judge-demo-01
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install "numpy<2" PyYAML
+.\.venv\Scripts\python.exe -c "import numpy, yaml; print('NumPy', numpy.__version__, '| PyYAML', yaml.__file__)"
 ```
 
-For the integrated demonstration, configure the team's watcher to launch that
-same command and monitor `runs/judge-demo-01`. Do not also launch a duplicate
-training process yourself. The spec does not define a `main.py` CLI, so agree
-on the watcher's entry command with its owner.
+Run training by itself:
+
+```powershell
+.\.venv\Scripts\python.exe -u demo/train.py --config demo/configs/bad_lr.yaml --run-dir runs/judge-demo-01
+```
+
+For the local integrated watcher demo, let the watcher launch training; do not
+start a second training process. Use a fresh run directory for each rehearsal:
+
+```powershell
+.\.venv\Scripts\python.exe -m watcher.runner --run-dir runs/judge-demo-01 --config demo/configs/bad_lr.yaml --cwd . -- .\.venv\Scripts\python.exe -u demo/train.py --config demo/configs/bad_lr.yaml --run-dir runs/judge-demo-01
+```
+
+To rehearse the failure quickly, add `--step-delay 0 --warmup-steps 0` to the
+training command (after `train.py` and its required arguments). For example:
+
+```powershell
+.\.venv\Scripts\python.exe -m watcher.runner --run-dir runs/local-fast --config demo/configs/bad_lr.yaml --cwd . -- .\.venv\Scripts\python.exe -u demo/train.py --config demo/configs/bad_lr.yaml --run-dir runs/local-fast --step-delay 0 --warmup-steps 0
+```
+
+The watcher returns the training process's exit code. Exit code 2 is the
+expected numerical failure; inspect `runs/<run-id>/incidents/` and
+`runs/<run-id>/watcher-*.log` for the incident and watcher output.
 
 ### Why failure happens near two minutes
 
@@ -84,8 +108,8 @@ First, after explicit approval, create the fix branch and change only `lr` in
 
 ### 1. Dry-run the patched configuration in a NEW directory
 
-```bash
-python -u demo/train.py --config demo/configs/bad_lr.yaml --run-dir runs/judge-dry-run-01 --resume runs/judge-demo-01/checkpoints/latest.npz --step-delay 0 --max-steps 100
+```powershell
+.\.venv\Scripts\python.exe -u demo/train.py --config demo/configs/bad_lr.yaml --run-dir runs/judge-dry-run-01 --resume runs/judge-demo-01/checkpoints/latest.npz --step-delay 0 --max-steps 100
 ```
 
 Before this command, patch the config as above. Exit code 0 means the requested
@@ -96,14 +120,14 @@ incident artifacts intact. Rehearsals need a fresh dry-run directory too.
 
 ### 2. Resume the original run with the approved configuration
 
-```bash
-python -u demo/train.py --config demo/configs/bad_lr.yaml --run-dir runs/judge-demo-01 --resume runs/judge-demo-01/checkpoints/latest.npz
+```powershell
+.\.venv\Scripts\python.exe -u demo/train.py --config demo/configs/bad_lr.yaml --run-dir runs/judge-demo-01 --resume runs/judge-demo-01/checkpoints/latest.npz
 ```
 
 Or, for standalone recovery using the supplied good file:
 
-```bash
-python -u demo/train.py --config demo/configs/good.yaml --run-dir runs/judge-demo-01 --resume runs/judge-demo-01/checkpoints/latest.npz
+```powershell
+.\.venv\Scripts\python.exe -u demo/train.py --config demo/configs/good.yaml --run-dir runs/judge-demo-01 --resume runs/judge-demo-01/checkpoints/latest.npz
 ```
 
 The checkpoint restores weights, global step, and dataset seed. This optimizer

@@ -38,6 +38,10 @@ class Plateau:
     Prefers validation loss; changing metric also resets its baseline.
     """
     def __init__(self, patience=0, min_delta=0.001):
+        if type(patience) is not int or patience < 0:
+            raise ValueError('patience must be a nonnegative integer')
+        if isinstance(min_delta, bool) or not isinstance(min_delta, (int, float)) or not math.isfinite(min_delta) or min_delta < 0:
+            raise ValueError('min_delta must be a nonnegative finite number')
         self.patience = patience
         self.min_delta = min_delta
         self.identity = None
