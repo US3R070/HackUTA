@@ -16,9 +16,9 @@ Do **not** escalate trivial errors you can fix safely yourself.
 
 ## Protocol
 
-1. Call `escalate_failure` **once** with a speakable `summary` (<15s), `severity` (`LOW`|`HIGH`), `details`, and `proposed_fix` if any. Prefer `share="screen"` for the FaceTime demo (or `window:<title>` for privacy).
+1. Call `escalate_failure` **once** with a speakable `summary` (<15s), `severity` (`LOW`|`HIGH`), `details`, and `proposed_fix` if any. Prefer `share="screen"` for the phone demo (or `window:<title>` on Windows for privacy).
 2. Narrate with `report_action` **before and after every meaningful step** (read file, run command, edit, test).
-3. **Autonomous wait (required):** Right after `escalate_failure`, enter a loop and call `get_human_response(wait_seconds=25)` repeatedly until you get a real decision (`approve` / `reject` / `stop` / `instruction`). Do **not** stop and ask the TUI user what to do next — the human is on FaceTime; their yes/no arrives via this tool (from the Mentor voice bridge).
+3. **Autonomous wait (required):** Right after `escalate_failure`, enter a loop and call `get_human_response(wait_seconds=25)` repeatedly until you get a real decision (`approve` / `reject` / `stop` / `instruction`). Do **not** stop and ask the TUI user what to do next — the human is on the phone; their yes/no arrives via this tool (from the Mentor voice bridge).
    - On `none`: loop again immediately.
    - On `approve`: apply the proposed fix quickly, `report_action` started/done, then **speak on the call** (see below), then `end_escalation`.
    - On `reject`: do not edit; one short abort line via `speak_to_caller`; `end_escalation(outcome="aborted")`.
@@ -27,7 +27,7 @@ Do **not** escalate trivial errors you can fix safely yourself.
 4. Never treat silence / `none` as approval.
 5. Use `set_screen_view` so the human sees what they need (traceback terminal, diff, rendered plot via `image:<path>`).
 6. **Repo boundary (this HackUTA demo):** config fixes may edit `demo/configs/*.yaml` in this repo. For a separate train repo, use branch `agent/fix-<incident_id>` there instead. Never push or merge without approval.
-7. **Call script (FaceTime live):** the voice bridge already plays a short “on it…” filler when approve is queued — do **not** add another thinking line.
+7. **Call script (phone live):** the voice bridge already plays a short “on it…” filler when approve is queued — do **not** add another thinking line.
    After the fix:
    1. `speak_to_caller`: `"Okay — it's fixed. Is there anything else you need?"` — wait `duration_s`
    2. `get_human_response(wait_seconds=8)` **once only** — never poll again after this

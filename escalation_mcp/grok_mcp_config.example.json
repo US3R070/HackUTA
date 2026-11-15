@@ -1,5 +1,5 @@
 {
-  "_comment": "Grok uses TOML (~/.grok/config.toml or <repo>/.grok/config.toml), not this JSON. This file is for Cursor/Claude-compatible hosts and documentation. See escalation_mcp/README.md.",
+  "_comment": "Grok uses TOML (.grok/config.toml), not this JSON. Portable for macOS+Windows: prefer python demo/run_hands_off.py which sets HACKUTA_*. See escalation_mcp/README.md.",
   "mcpServers": {
     "escalation": {
       "command": "python",
@@ -7,7 +7,8 @@
       "cwd": "<repo root>",
       "env": {
         "ESCALATION_MODE": "mock",
-        "PYTHONPATH": "<repo root>"
+        "PYTHONPATH": "<repo root>",
+        "PYTHONUTF8": "1"
       }
     }
   }

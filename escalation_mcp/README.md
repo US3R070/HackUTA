@@ -64,24 +64,40 @@ uvicorn escalation_mcp.dev_echo_server:app --port 8787
 
 Grok's native MCP config is **TOML**, not JSON. Confirmed from `~/.grok/docs/user-guide/07-mcp-servers.md`.
 
-**Project scope (recommended)** — already provided as `.grok/config.toml` in this repo:
+**Project scope (recommended)** — `.grok/config.toml` is portable (macOS + Windows).
+It expands `${HACKUTA_PYTHON}` / `${HACKUTA_ROOT}` (set automatically by
+`python demo/run_hands_off.py`):
 
 ```toml
 [mcp_servers.escalation]
-command = "C:\\Users\\USER\\HackUTA\\HackUTA\\.venv\\Scripts\\python.exe"
+command = "${HACKUTA_PYTHON:-python}"
 args = ["-m", "escalation_mcp"]
-cwd = "C:\\Users\\USER\\HackUTA\\HackUTA"
+cwd = "${HACKUTA_ROOT:-.}"
 enabled = true
 startup_timeout_sec = 30
 tool_timeout_sec = 60
-tool_timeouts = { get_human_response = 30 }
-env = { ESCALATION_MODE = "mock", PYTHONPATH = "C:\\Users\\USER\\HackUTA\\HackUTA" }
+tool_timeouts = { get_human_response = 60 }
+env = { ESCALATION_MODE = "live", PYTHONPATH = "${HACKUTA_ROOT:-.}", PYTHONUTF8 = "1" }
 ```
 
-Or via CLI from the repo root:
+Hands-off live call demo (either OS, from repo root):
 
 ```bash
-grok mcp add escalation --scope project -e ESCALATION_MODE=mock -- .venv/Scripts/python.exe -m escalation_mcp
+# macOS / Linux
+./demo/run_hands_off.sh
+# Windows
+demo\run_hands_off.cmd
+# or any OS
+python demo/run_hands_off.py
+```
+
+Or register via CLI from the repo root (after activating `.venv`):
+
+```bash
+# macOS / Linux
+grok mcp add escalation --scope project -e ESCALATION_MODE=mock -- .venv/bin/python -m escalation_mcp
+# Windows
+grok mcp add escalation --scope project -e ESCALATION_MODE=mock -- .venv\Scripts\python.exe -m escalation_mcp
 ```
 
 A JSON-shaped example for other hosts is in `grok_mcp_config.example.json`.

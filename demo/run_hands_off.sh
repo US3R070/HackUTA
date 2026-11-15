@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Hands-off FaceTime escalate: no TUI approve prompts (you're on the phone).
+# macOS / Linux wrapper → demo/run_hands_off.py
 set -euo pipefail
-cd "$(dirname "$0")/.."
-export PATH="${HOME}/.grok/bin:${PATH}"
-# Interactive TUI (don't use -p); always-approve so you're not stuck at the keyboard.
-exec grok --always-approve --fullscreen "$(cat demo/hands_off_escalate_prompt.txt)"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+if [[ -x "$ROOT/.venv/bin/python" ]]; then
+  exec "$ROOT/.venv/bin/python" "$ROOT/demo/run_hands_off.py" "$@"
+fi
+exec python3 "$ROOT/demo/run_hands_off.py" "$@"
