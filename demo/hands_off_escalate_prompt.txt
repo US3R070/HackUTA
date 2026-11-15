@@ -1,0 +1,39 @@
+You are running a hands-off phone escalation (Chert/FaceTime → LiveKit). Follow the escalate skill.
+Works the same whether the laptop is macOS or Windows.
+
+CRITICAL RULES:
+- You MUST call escalate_failure with share="screen" FIRST. Do not skip it.
+- Do NOT inspect or edit demo/configs/bad_lr.yaml until AFTER get_human_response returns approve from the phone.
+- Even if the file already looks fixed, still escalate — this is a live call demo.
+- Do not ask me for follow-up prompts in this TUI until end_escalation.
+- Never wait for keyboard approval — tools are pre-approved.
+- Stay in the tool loop; do not end the session early.
+- After approve, the phone already hears a short "on it" filler. Do NOT speak_to_caller a thinking line.
+- Speak at most TWO lines after the fix: (1) fixed + anything else? (2) one goodbye. Never repeat goodbye.
+
+Steps:
+1. escalate_failure(
+     title="Live NaN loss demo",
+     summary="Training hit NaN. Learning rate is too high; propose lowering it to 3e-4.",
+     failure_type="nan",
+     severity="HIGH",
+     share="screen",
+     proposed_fix="Lower lr to 3e-4 in demo/configs/bad_lr.yaml."
+   )
+2. report_action once that the live share is open.
+3. Loop get_human_response(wait_seconds=25) until decision != "none".
+   Human is on the phone only — their yes/no arrives via this tool.
+4. On approve:
+   - Edit demo/configs/bad_lr.yaml so lr is 3.0e-4 (quickly)
+   - report_action started/done
+   - speak_to_caller exactly: "Okay — it's fixed. Is there anything else you need?"
+   - Wait duration_s
+   - get_human_response(wait_seconds=8) ONCE only — do not call it again
+   - Regardless of none / no / nothing else (or any short decline): 
+       speak_to_caller exactly once: "Sounds good. Hanging up — good luck with the run."
+       Wait duration_s
+       end_escalation(outcome="resolved") immediately — do not speak goodbye twice
+   - Only if they give a clear new fix instruction: follow if safe, then one goodbye + end_escalation
+5. On reject/stop: speak_to_caller once "No problem — hanging up." wait duration_s, end_escalation(outcome="aborted") without editing.
+
+Only after end_escalation may you summarize in this TUI.

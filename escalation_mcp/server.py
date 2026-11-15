@@ -33,18 +33,12 @@ async def escalate_failure(
     run_id: str | None = None,
     share: str = "screen",
     incident_id: str | None = None,
-    default_action: str | None = None,
 ) -> dict[str, Any]:
     """Open an escalation: build packet, start screen share, notify cloud agent.
 
     Prefer share=\"window:<terminal or IDE title>\" for privacy. Use share=\"none\"
     to skip screen share. Pass incident_id to reuse a pre-minted id from a demo
     script. If an escalation is already active, returns it.
-
-    default_action: what you will do if the human never decides (no answer after
-    one redial, hangs up, or goes idle). It MUST be non-destructive, e.g. "keep the
-    run paused at checkpoint 4000 and text a summary". The call agent announces it
-    up front. Omit it to use the safe fallback (change nothing, send a summary).
     """
     return await sess.start_escalation(
         title=title,
@@ -56,7 +50,6 @@ async def escalate_failure(
         run_id=run_id,
         share=share,
         incident_id=incident_id,
-        default_action=default_action,
     )
 
 
@@ -78,13 +71,9 @@ async def get_human_response(
 ) -> dict[str, Any]:
     """Return the oldest unconsumed human decision. wait_seconds long-polls (max 25).
 
-    decision: approve | reject | stop | instruction (with text) | hangup | none.
-    The call stays live after a decision so the human can keep watching and give
-    more instructions; keep polling between steps. Every response includes
-    call_state (waiting_answer|live|watching|agent_done|ended) and ends_in_s.
-    decision="hangup" means the call is over (end_reason: hangup | caller_left |
-    idle_timeout | no_answer | agent_done). If run_default_action is true the human
-    never decided: perform default_action (non-destructive), then end_escalation.
+    When a real decision arrives (approve/reject/stop/instruction), the MCP
+    auto-resets: stops the :8765 preview, clears active state, frees the port
+    for the next escalate_failure. end_escalation stays safe/idempotent after that.
     """
     return await sess.poll_human_response(incident_id, wait_seconds)
 
@@ -104,17 +93,26 @@ async def set_screen_view(incident_id: str, view: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+async def speak_to_caller(incident_id: str, text: str) -> dict[str, Any]:
+    """Speak a short line on the live FaceTime call (ElevenLabs TTS).
+
+    Use after applying a fix ("There we go, I fixed it…") and again for goodbye
+    before end_escalation. Returns duration_s — wait that long before hanging up.
+    """
+    return await sess.speak_to_caller(incident_id, text)
+
+
+@mcp.tool()
 async def end_escalation(
     incident_id: str,
     outcome: Literal["resolved", "aborted", "handed_off"],
     summary: str,
-    hang_up_now: bool = False,
 ) -> dict[str, Any]:
-    """Agent is done. If the human is still on the call the monitor stays up for a
-    short grace (CALL_DONE_GRACE_S, extended while they keep talking) so they see
-    the result, then hangs up and sends the final report. hang_up_now=True skips
-    the grace."""
-    return await sess.end_escalation(incident_id, outcome, summary, hang_up_now)
+    """Finish the escalation: final report, stop screen share, leave room.
+
+    Speak goodbye with speak_to_caller first and wait duration_s before calling this.
+    """
+    return await sess.end_escalation(incident_id, outcome, summary)
 
 
 def main() -> None:

@@ -77,10 +77,16 @@ Pitch: *Grok writes the code, Gemini sees and talks.*
 
 ## Setup
 ```bash
+# macOS / Linux
 python -m venv .venv && source .venv/bin/activate
+# Windows
+python -m venv .venv && .venv\Scripts\activate
+
 pip install -r requirements.txt
-cp .env.example .env   # fill keys
+cp .env.example .env   # fill keys (Windows: copy .env.example .env)
 ```
+
+Laptop OS can be **macOS or Windows** — Chert bridges the phone (FaceTime) into LiveKit; screen share + MCP run locally. Hands-off demo: `python demo/run_hands_off.py` (or `demo/run_hands_off.sh` / `demo\run_hands_off.cmd`).
 
 ## Build order
 1. Chert + LiveKit smoke test (call connects, screen visible on phone)
