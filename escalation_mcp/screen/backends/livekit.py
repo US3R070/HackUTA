@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("escalation_mcp")
 
-W, H, FPS = 1280, 720, 10
+W, H, FPS = 1280, 720, 15  # match screen_test.py; Chert is happier at ≥10–15 fps
 
 
 class LiveKitScreenBackend(ScreenBackend):
@@ -50,15 +50,21 @@ class LiveKitScreenBackend(ScreenBackend):
         logger.info("published agent camera track %sx%s (H.264)", W, H)
 
     async def _push_frames(self) -> None:
+        import numpy as np
         from livekit import rtc
 
         while not self._stop.is_set():
             try:
                 if self._capture and self._capture.latest_rgba is not None and self._source:
+                    # Match screen_test.py: Chert/FaceTime expects BGRA + opaque alpha.
+                    # RGBA here shows as gray/wrong colors on the phone even when
+                    # the local MJPEG preview (JPEG) looks fine.
                     img = self._capture.latest_rgba.convert("RGBA").resize((W, H))
-                    img.putalpha(255)  # opaque, or FaceTime renders black
+                    rgba = np.asarray(img, dtype=np.uint8)
+                    bgra = np.ascontiguousarray(rgba[:, :, [2, 1, 0, 3]])
+                    bgra[:, :, 3] = 255
                     self._source.capture_frame(
-                        rtc.VideoFrame(W, H, rtc.VideoBufferType.RGBA, img.tobytes())
+                        rtc.VideoFrame(W, H, rtc.VideoBufferType.BGRA, bgra.tobytes())
                     )
             except Exception:  # noqa: BLE001
                 logger.exception("LiveKit frame push failed")

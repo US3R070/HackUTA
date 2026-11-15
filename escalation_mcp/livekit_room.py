@@ -23,7 +23,9 @@ BRIDGE_IDENTITY = "chert-bridge"   # identity we give Chert's bridge token
 SR, CH = 48000, 1
 SAMPLES = SR // 50                 # 20 ms frames
 FRAME_BYTES = SAMPLES * 2 * CH     # int16
-IDLE_TONE = os.getenv("AGENT_IDLE_TONE", "0") == "1"  # fallback if chime isn't enough
+# Chert/FaceTime often drops ~10s on pure silence and shows a gray placeholder.
+# Default ON; set AGENT_IDLE_TONE=0 to force silence.
+IDLE_TONE = os.getenv("AGENT_IDLE_TONE", "1") != "0"
 
 
 def room_name_for(incident_id: str) -> str:

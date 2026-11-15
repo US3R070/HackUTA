@@ -2,11 +2,12 @@
 # See escalation_mcp/README.md and ~/.grok/docs/user-guide/07-mcp-servers.md
 
 [mcp_servers.escalation]
-command = "C:\\Users\\USER\\HackUTA\\HackUTA\\.venv\\Scripts\\python.exe"
+command = "/Users/ronismaili/PycharmProjects/HackUTA/.venv/bin/python"
 args = ["-m", "escalation_mcp"]
-cwd = "C:\\Users\\USER\\HackUTA\\HackUTA"
+cwd = "/Users/ronismaili/PycharmProjects/HackUTA"
 enabled = true
 startup_timeout_sec = 30
 tool_timeout_sec = 60
 tool_timeouts = { get_human_response = 30 }
-env = { ESCALATION_MODE = "mock", PYTHONPATH = "C:\\Users\\USER\\HackUTA\\HackUTA", PYTHONUTF8 = "1" }
+# live = real Chert/LiveKit call. Use mock for offline MCP tests.
+env = { ESCALATION_MODE = "live", AGENT_IDLE_TONE = "1", PYTHONPATH = "/Users/ronismaili/PycharmProjects/HackUTA", PYTHONUTF8 = "1" }

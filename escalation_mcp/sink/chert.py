@@ -32,8 +32,11 @@ class ChertSink(Sink):
             call = await asyncio.to_thread(
                 place_call, os.environ["USER_PHONE"], token, SCREEN_IDENTITY, True
             )
-            self.call_ids[packet.incident_id] = call["id"]
-            logger.info("chert call %s placed for %s", call["id"], packet.incident_id)
+            call_id = call.get("id") if isinstance(call, dict) else None
+            if not call_id:
+                raise RuntimeError(f"Chert place_call returned no id: {call!r}")
+            self.call_ids[packet.incident_id] = call_id
+            logger.info("chert call %s placed for %s", call_id, packet.incident_id)
             return []
         except Exception as exc:  # noqa: BLE001
             msg = f"chert call failed: {exc}"
