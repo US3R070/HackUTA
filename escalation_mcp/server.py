@@ -33,12 +33,19 @@ async def escalate_failure(
     run_id: str | None = None,
     share: str = "screen",
     incident_id: str | None = None,
+    focus: str | None = None,
 ) -> dict[str, Any]:
     """Open an escalation: build packet, start screen share, notify cloud agent.
 
     Prefer share=\"window:<terminal or IDE title>\" for privacy. Use share=\"none\"
     to skip screen share. Pass incident_id to reuse a pre-minted id from a demo
     script. If an escalation is already active, returns it.
+
+    focus: optional \"path:line\" of the line you believe caused the failure
+    (e.g. \"demo/configs/bad_lr.yaml:1\"). With share=\"screen\" the call opens
+    zoomed onto that line in VS Code. Put other useful spots in
+    details[\"code_anchors\"] = [{\"label\": ..., \"target\": \"path:line\"}] so the
+    voice agent can show them on request.
     """
     return await sess.start_escalation(
         title=title,
@@ -50,7 +57,27 @@ async def escalate_failure(
         run_id=run_id,
         share=share,
         incident_id=incident_id,
+        focus=focus,
     )
+
+
+@mcp.tool()
+async def focus_code(incident_id: str, query: str) -> dict[str, Any]:
+    """Pan/zoom the caller's screen onto one line of code in VS Code.
+
+    query: \"path:line\" (preferred, relative to the repo) or a short text snippet
+    to search for (first match wins). Use it to point at the line you believe is
+    the problem, or at the line you just edited. Only works with share=\"screen\";
+    if the line can't be seen (VS Code closed/covered) the camera stays on the
+    full screen. Call show_full_screen to zoom back out.
+    """
+    return await sess.focus_code(incident_id, query, source="grok")
+
+
+@mcp.tool()
+async def show_full_screen(incident_id: str) -> dict[str, Any]:
+    """Zoom the caller's screen camera back out to the whole screen."""
+    return await sess.show_full_screen(incident_id, source="grok")
 
 
 @mcp.tool()

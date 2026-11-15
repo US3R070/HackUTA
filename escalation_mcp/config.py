@@ -45,6 +45,8 @@ class Settings:
     screen_fps: float = 5.0
     screen_max_width: int = 1280
     preview_port: int = 8765
+    # Pan/zoom onto a VS Code line (share="screen" only). Zoom/font: CODE_CAMERA_* env.
+    code_camera: bool = True
     livekit_url: str = ""
     livekit_api_key: str = ""
     livekit_api_secret: str = ""
@@ -83,6 +85,7 @@ def load_settings(*, require_live: bool | None = None) -> Settings:
         screen_fps=float(os.getenv("SCREEN_FPS") or "10"),
         screen_max_width=int(os.getenv("SCREEN_MAX_WIDTH") or "1280"),
         preview_port=int(os.getenv("PREVIEW_PORT") or "8765"),
+        code_camera=(os.getenv("CODE_CAMERA") or "1").strip().lower() not in ("0", "false", "no", "off"),
         livekit_url=os.getenv("LIVEKIT_URL") or "",
         livekit_api_key=os.getenv("LIVEKIT_API_KEY") or "",
         livekit_api_secret=os.getenv("LIVEKIT_API_SECRET") or "",

@@ -8,3 +8,4 @@ runs/*
 *.db
 .DS_Store
 shot.png
+.vscode/*.code-camera-backup

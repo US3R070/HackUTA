@@ -63,6 +63,8 @@ class RuntimeHandles:
     auto_reset_on_decision: bool = True
     voice_bridge: Any | None = None
     voice_task: asyncio.Task[None] | None = None
+    # Pan/zoom camera over the real screen (share="screen"); None otherwise.
+    code_camera: Any | None = None
 
 
 RUNTIME = RuntimeHandles(settings=Settings(), sink=MockSink(), channel=MockChannel())
@@ -104,6 +106,24 @@ def _overlay_fn(img):
     )
 
 
+def _make_code_camera(view: str, settings: Settings) -> Any | None:
+    """Camera-capable frame source for share="screen" (None for other views / tests)."""
+    if view != "screen" or not settings.code_camera or RUNTIME.fake_frames is not None:
+        return None
+    try:
+        from escalation_mcp.config import repo_root
+        from escalation_mcp.screen.code_camera import CameraConfig, CodeCameraSource
+
+        return CodeCameraSource(
+            CameraConfig.from_env(repo_root()),
+            monitor_index=settings.screen_monitor,
+            max_width=settings.screen_max_width,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("code camera unavailable; plain screen share")
+        return None
+
+
 async def _setup_logging(incident_id: str) -> None:
     log_path = incident_dir(incident_id) / "mcp.log"
     root = logging.getLogger("escalation_mcp")
@@ -127,6 +147,14 @@ async def _teardown_media() -> None:
     """Stop capture/preview/LiveKit and free the locked preview port (8765)."""
     port = RUNTIME.settings.preview_port
     RUNTIME.stop_event.set()
+
+    # First: give VS Code its own settings back, whatever else fails below.
+    if RUNTIME.code_camera is not None:
+        try:
+            await asyncio.to_thread(RUNTIME.code_camera.close)
+        except Exception:  # noqa: BLE001
+            logger.exception("code camera close failed")
+        RUNTIME.code_camera = None
 
     if RUNTIME.voice_task:
         RUNTIME.voice_task.cancel()
@@ -276,6 +304,7 @@ async def start_escalation(
     run_id: str | None = None,
     share: str = "screen",
     incident_id: str | None = None,
+    focus: str | None = None,
 ) -> dict[str, Any]:
     existing = await STATE.get_active()
     capture_alive = bool(
@@ -353,7 +382,14 @@ async def start_escalation(
             frame_source = RUNTIME.fake_frames
         warnings.extend(view_warnings)
 
-        capture = CaptureLoop(frame_source, _overlay_fn, fps=settings.screen_fps)
+        camera = _make_code_camera(view, settings)
+        if camera is not None:
+            frame_source = camera
+            RUNTIME.code_camera = camera
+
+        # Camera pans look choppy at 10 fps; capture as fast as ~15 fps allows.
+        fps = max(settings.screen_fps, 15.0) if camera is not None else settings.screen_fps
+        capture = CaptureLoop(frame_source, _overlay_fn, fps=fps)
         RUNTIME.capture = capture
 
         preview = PreviewBackend(host="127.0.0.1", port=settings.preview_port)
@@ -459,12 +495,19 @@ async def start_escalation(
         },
     )
 
+    if focus and RUNTIME.code_camera is not None:
+        # Aim at the suspected line in the background; escalate_failure returns now.
+        asyncio.create_task(
+            focus_code(incident_id, focus, source="escalate_failure"), name="code-camera-initial"
+        )
+
     return {
         "incident_id": incident_id,
         "status": "active",
         "room": room,
         "preview_url": preview_url,
         "sink": RUNTIME.sink.name,
+        "code_camera": RUNTIME.code_camera is not None,
         "warnings": warnings,
     }
 
@@ -601,6 +644,17 @@ async def set_screen_view(incident_id: str, view: str) -> dict[str, Any]:
         pass
     if RUNTIME.fake_frames is not None:
         frame_source = RUNTIME.fake_frames
+    camera = RUNTIME.code_camera
+    if camera is not None:
+        # Leaving or re-entering the plain screen view resets the camera to full screen.
+        await asyncio.to_thread(camera.overview)
+        if view == "screen":
+            frame_source = camera
+    elif view == "screen":
+        camera = _make_code_camera(view, RUNTIME.settings)
+        if camera is not None:
+            RUNTIME.code_camera = camera
+            frame_source = camera
     RUNTIME.capture.frame_source = frame_source
     incident.share = view
     append_agent_log(
@@ -610,6 +664,43 @@ async def set_screen_view(incident_id: str, view: str) -> dict[str, Any]:
     result: dict[str, Any] = {"ok": True, "view": view}
     if warnings:
         result["warnings"] = warnings
+    return result
+
+
+def _live_camera() -> Any | None:
+    """The code camera, only if it is what the call is currently showing."""
+    camera = RUNTIME.code_camera
+    if camera is None or RUNTIME.capture is None or RUNTIME.capture.frame_source is not camera:
+        return None
+    return camera
+
+
+async def focus_code(incident_id: str, query: str, source: str = "grok") -> dict[str, Any]:
+    """Pan/zoom the shared screen onto one code line (file:line or text to search)."""
+    STATE.require(incident_id)
+    camera = _live_camera()
+    if camera is None:
+        return {"ok": False, "error": "code camera needs an active share=\"screen\" view"}
+    result = await asyncio.to_thread(camera.focus, query)
+    append_agent_log(
+        incident_id,
+        {"ts": _utc_now_iso(), "tool": "focus_code", "from": source, "query": query[:200],
+         "ok": result.get("ok"), "target": result.get("target")},
+    )
+    logger.info("focus_code (%s) %r -> %s", source, query, result)
+    return result
+
+
+async def show_full_screen(incident_id: str, source: str = "grok") -> dict[str, Any]:
+    """Ease the camera back out to the whole screen."""
+    STATE.require(incident_id)
+    camera = RUNTIME.code_camera
+    if camera is None:
+        return {"ok": True, "view": "full_screen", "note": "camera not in use"}
+    result = await asyncio.to_thread(camera.overview)
+    append_agent_log(
+        incident_id, {"ts": _utc_now_iso(), "tool": "show_full_screen", "from": source}
+    )
     return result
 
 

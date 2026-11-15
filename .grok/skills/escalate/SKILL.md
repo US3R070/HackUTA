@@ -33,7 +33,7 @@ Do **not** escalate trivial errors you can fix safely yourself.
    - `hangup`: the call is over. `end_escalation(outcome="resolved"` if you applied a fix, else `"aborted"`, `summary=...)`, then return control.
 5. **`fix_done` summary:** 1–2 plain sentences the voice agent will explain: what changed (file, old → new value), why that value, what the human should see next. Example: "Changed lr from 5.0 to 3e-4 in the bad-LR config; updates stay small and stable, so loss should drop smoothly within ~100 steps."
 6. Never treat silence / `none` as approval.
-7. Use `set_screen_view` so the human sees what they need (traceback terminal, diff, rendered plot via `image:<path>`).
+7. **Screen camera (share="screen"):** pass `focus="path:line"` to `escalate_failure` for the line you believe caused the failure, so the call opens zoomed on it in VS Code. Add other spots worth showing to `details["code_anchors"] = [{"label": "learning rate", "target": "demo/configs/bad_lr.yaml:1"}]` (the voice agent can show these on request). After an edit, `focus_code(incident_id, "path:line")` on the changed line; `show_full_screen(incident_id)` to zoom back out. Use `set_screen_view` for other views (traceback terminal, rendered plot via `image:<path>`).
 8. **Repo boundary (this HackUTA demo):** config fixes may edit `demo/configs/*.yaml` in this repo. For a separate train repo, use branch `agent/fix-<incident_id>` there instead. Never push or merge without approval.
 9. Only after `end_escalation` may you return control to the TUI user.
 10. **No voice agent** (mock mode, or the escalation result warns voice failed): fall back to one `speak_to_caller` line after the fix and before `end_escalation`.
@@ -51,13 +51,15 @@ escalate_failure(
   details={"log_tail": ["step=4200 loss=nan lr=5.0"], "config": {"lr": 5.0},
            "rationale": "lr=5.0 overshoots every step so loss diverges to inf then NaN; 3e-4 is the standard Adam default, ~16,000x smaller, stable but still fast."},
   proposed_fix="Lower lr to 3e-4 and resume from the step-4000 checkpoint.",
-  share="screen"
+  share="screen",
+  focus="demo/configs/bad_lr.yaml:1"
 )
 report_action(incident_id, "screen_share", "live", "done")
 get_human_response(incident_id, wait_seconds=25)  # -> none
 get_human_response(incident_id, wait_seconds=25)  # -> approve
 report_action(incident_id, "edit_file", "configs/bad_lr.yaml", "started")
 report_action(incident_id, "edit_file", "lr 5.0 -> 3e-4", "done")
+focus_code(incident_id, "demo/configs/bad_lr.yaml:1")
 fix_done(incident_id, "Changed lr from 5.0 to 3e-4 in bad_lr.yaml; updates stay stable, so loss should drop smoothly within ~100 steps.")
 get_human_response(incident_id, wait_seconds=25)  # -> hangup (agent said goodbye)
 end_escalation(incident_id, "resolved", "Lowered lr to 3e-4; ready to resume.")
