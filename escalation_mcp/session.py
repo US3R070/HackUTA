@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -34,6 +35,12 @@ from escalation_mcp.state import STATE, ActiveIncident
 logger = logging.getLogger("escalation_mcp")
 
 
+def _voice_agent_configured() -> bool:
+    return bool(
+        (os.getenv("ELEVENLABS_AGENT_ID") or os.getenv("AGENT_ID") or "").strip()
+    )
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -52,7 +59,10 @@ class RuntimeHandles:
     fake_frames: FrameSource | None = None  # injected in tests
     sharing: bool = False
     # After a human decision is delivered, runtime auto-resets (preview killed).
+    # Voice bridge keeps the FaceTime up so Grok can keep acting — disable then.
     auto_reset_on_decision: bool = True
+    voice_bridge: Any | None = None
+    voice_task: asyncio.Task[None] | None = None
 
 
 RUNTIME = RuntimeHandles(settings=Settings(), sink=MockSink(), channel=MockChannel())
@@ -117,6 +127,24 @@ async def _teardown_media() -> None:
     """Stop capture/preview/LiveKit and free the locked preview port (8765)."""
     port = RUNTIME.settings.preview_port
     RUNTIME.stop_event.set()
+
+    if RUNTIME.voice_task:
+        RUNTIME.voice_task.cancel()
+        try:
+            await RUNTIME.voice_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001
+            logger.exception("voice task cancel failed")
+        RUNTIME.voice_task = None
+
+    if RUNTIME.voice_bridge:
+        try:
+            await RUNTIME.voice_bridge.stop()
+        except Exception:  # noqa: BLE001
+            logger.exception("voice bridge stop failed")
+        RUNTIME.voice_bridge = None
+
     if RUNTIME.capture_task:
         try:
             await asyncio.wait_for(RUNTIME.capture_task, timeout=2.0)
@@ -406,6 +434,20 @@ async def start_escalation(
     warnings.extend(sink_warnings)
     incident.warnings = warnings
 
+    # FaceTime Mentor: ElevenLabs Agents over the same LiveKit participant.
+    if (
+        settings.mode == "live"
+        and RUNTIME.sharing
+        and RUNTIME.room_conn is not None
+        and _voice_agent_configured()
+    ):
+        RUNTIME.auto_reset_on_decision = False
+        RUNTIME.voice_task = asyncio.create_task(
+            _start_voice_bridge(packet), name="eleven-agent-bridge"
+        )
+    elif _voice_agent_configured() and settings.mode != "live":
+        warnings.append("ElevenLabs agent configured but ESCALATION_MODE is not live")
+
     append_agent_log(
         incident_id,
         {
@@ -425,6 +467,43 @@ async def start_escalation(
         "sink": RUNTIME.sink.name,
         "warnings": warnings,
     }
+
+
+async def _start_voice_bridge(packet: Any) -> None:
+    """Wait for Chert bridge + media grace, then start ElevenLabs on this participant.
+
+    FaceTime shows gray for ~2–3s after answer while video attaches. If Mentor
+    greets immediately, the opening words are lost. Wait out that window first.
+    """
+    room_conn = RUNTIME.room_conn
+    if room_conn is None:
+        return
+    try:
+        await asyncio.wait_for(room_conn.bridge_joined.wait(), timeout=90.0)
+    except asyncio.TimeoutError:
+        logger.warning("ElevenLabs bridge: Chert bridge never joined; skipping voice")
+        return
+
+    grace = float(os.getenv("FACETIME_AUDIO_GRACE_S") or "3.5")
+    logger.info("ElevenLabs bridge: waiting %.1fs for FaceTime video to attach", grace)
+    await asyncio.sleep(max(0.0, grace))
+
+    try:
+        from escalation_mcp.voice.eleven_agent import ElevenAgentBridge
+
+        bridge = ElevenAgentBridge(
+            room_conn, packet, loop=asyncio.get_running_loop()
+        )
+        await bridge.start()
+        RUNTIME.voice_bridge = bridge
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("ElevenLabs agent bridge failed to start")
+        # Surface into the active incident so Grok/operators see it.
+        active = await STATE.get_active()
+        if active and active.incident_id == getattr(packet, "incident_id", None):
+            msg = f"ElevenLabs voice failed: {exc}"
+            if msg not in active.warnings:
+                active.warnings.append(msg)
 
 
 async def report_action(

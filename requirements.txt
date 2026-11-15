@@ -9,6 +9,7 @@ livekit-api
 livekit-agents
 livekit-plugins-google
 livekit-plugins-elevenlabs
+elevenlabs>=1.50
 mss
 numpy
 matplotlib

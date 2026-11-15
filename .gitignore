@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .venv/
+.vendor/
 runs/*
 !runs/.gitkeep
 *.db
