@@ -13,3 +13,10 @@ numpy
 matplotlib
 torch
 pytest
+mcp>=1.0,<2
+livekit
+pillow
+python-dotenv
+httpx
+pygetwindow; sys_platform == "win32"
+pytest-asyncio
