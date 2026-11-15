@@ -1,0 +1,14 @@
+{
+  "_comment": "Grok uses TOML (~/.grok/config.toml or <repo>/.grok/config.toml), not this JSON. This file is for Cursor/Claude-compatible hosts and documentation. See escalation_mcp/README.md.",
+  "mcpServers": {
+    "escalation": {
+      "command": "python",
+      "args": ["-m", "escalation_mcp"],
+      "cwd": "<repo root>",
+      "env": {
+        "ESCALATION_MODE": "mock",
+        "PYTHONPATH": "<repo root>"
+      }
+    }
+  }
+}
