@@ -16,25 +16,24 @@ Do **not** escalate trivial errors you can fix safely yourself.
 
 ## Protocol
 
-1. Call `escalate_failure` **once** with a speakable `summary` (<15s), `severity` (`LOW`|`HIGH`), `details`, `proposed_fix` if any, and a **non-destructive** `default_action` (what you will do if the human never decides, e.g. "keep the run paused at checkpoint 4000 and text a summary"). Prefer `share="window:<terminal or IDE title>"` for privacy.
+1. Call `escalate_failure` **once** with a speakable `summary` (<15s), `severity` (`LOW`|`HIGH`), `details`, and `proposed_fix` if any. Prefer `share="screen"` for the phone demo (or `window:<title>` on Windows for privacy).
 2. Narrate with `report_action` **before and after every meaningful step** (read file, run command, edit, test).
-3. **Between every step**, call `get_human_response(wait_seconds=0)`.
-   - On `stop`: halt immediately, revert uncommitted edits made during this incident, then `end_escalation(outcome="aborted")`.
-   - On `instruction`: follow it if safe; otherwise report why not via `report_action`.
-4. **Before any destructive or irreversible action**, call `get_human_response(wait_seconds=25)` in a loop until `approve` or `reject`. Never treat silence as approval.
+3. **Autonomous wait (required):** Right after `escalate_failure`, enter a loop and call `get_human_response(wait_seconds=25)` repeatedly until you get a real decision (`approve` / `reject` / `stop` / `instruction`). Do **not** stop and ask the TUI user what to do next — the human is on the phone; their yes/no arrives via this tool (from the Mentor voice bridge).
+   - On `none`: loop again immediately.
+   - On `approve`: apply the proposed fix quickly, `report_action` started/done, then **speak on the call** (see below), then `end_escalation`.
+   - On `reject`: do not edit; one short abort line via `speak_to_caller`; `end_escalation(outcome="aborted")`.
+   - On `stop`: halt, revert uncommitted edits from this incident, one goodbye; `end_escalation(outcome="aborted")`.
+   - On `instruction`: follow if safe; `report_action`; then keep looping for further decisions until approve/reject/stop.
+4. Never treat silence / `none` as approval.
 5. Use `set_screen_view` so the human sees what they need (traceback terminal, diff, rendered plot via `image:<path>`).
-6. **Repo boundary:** training fixes belong in the **train** repo (`C:\Users\USER\HackUTA\train`), on branch `agent/fix-<incident_id>`. Never create training fix branches or commit train patches inside the HackUTA (`escalation_mcp`) repo. Never push or merge without approval.
-7. Finish with `end_escalation` (`resolved` / `aborted` / `handed_off`). If the human is still on the call, the monitor stays up for a short grace first.
-
-## The call stays open after a decision
-
-A decision does not end the call: the human keeps watching your screen while you carry it out and can give more instructions. Keep calling `get_human_response(wait_seconds=0)` between steps even after `approve`.
-
-`get_human_response` returns `call_state` and `ends_in_s` on every call. `decision="hangup"` means the call is over (`end_reason`: `hangup` | `caller_left` | `idle_timeout` | `no_answer` | `agent_done`):
-- `run_default_action: true` -> the human never decided. Perform `default_action` (and nothing destructive), then `end_escalation(outcome="handed_off")`.
-- `run_default_action: false` -> keep following the decisions you already received, then `end_escalation`.
-
-`end_escalation` while the human is still on the call keeps the monitor up for a short grace so they see the result; pass `hang_up_now=true` to skip it.
+6. **Repo boundary (this HackUTA demo):** config fixes may edit `demo/configs/*.yaml` in this repo. For a separate train repo, use branch `agent/fix-<incident_id>` there instead. Never push or merge without approval.
+7. **Call script (phone live):** the voice bridge already plays a short “on it…” filler when approve is queued — do **not** add another thinking line.
+   After the fix:
+   1. `speak_to_caller`: `"Okay — it's fixed. Is there anything else you need?"` — wait `duration_s`
+   2. `get_human_response(wait_seconds=8)` **once only** — never poll again after this
+   3. On `none` / no / nothing else: `speak_to_caller` **once**: `"Sounds good. Hanging up — good luck with the run."` — wait `duration_s` — `end_escalation(outcome="resolved")` immediately
+   Never repeat the goodbye. Never ask “are you still there?” Never say hang-up twice.
+8. Only after `end_escalation` may you return control to the TUI user.
 
 Long commands: run them in the background and poll `get_human_response` — MCP cannot interrupt mid-command.
 
@@ -48,7 +47,6 @@ escalate_failure(
   severity="HIGH",
   details={"log_tail": ["step=4200 loss=nan lr=5.0"], "config": {"lr": 5.0}},
   proposed_fix="Lower lr to 3e-4 and resume from the step-4000 checkpoint.",
-  default_action="Keep the run paused at checkpoint 4000 and text a summary.",
   share="window:PowerShell"
 )
 
@@ -57,10 +55,8 @@ report_action(incident_id, "read_file", "configs/bad_lr.yaml", "done")
 get_human_response(incident_id, wait_seconds=0)  # -> none
 
 report_action(incident_id, "propose_edit", "lr 5.0 -> 3e-4", "started")
-get_human_response(incident_id, wait_seconds=25)  # -> approve, call_state=watching
+get_human_response(incident_id, wait_seconds=25)  # -> approve
 report_action(incident_id, "edit_file", "configs/bad_lr.yaml", "done")
-report_action(incident_id, "resume", "from ckpt_4000", "started")
-get_human_response(incident_id, wait_seconds=0)   # human still watching; may add instructions
 
 set_screen_view(incident_id, "image:runs/loss_after.png")
 end_escalation(incident_id, "resolved", "Lowered lr to 3e-4; ready to resume.")

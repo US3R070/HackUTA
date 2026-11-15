@@ -107,11 +107,16 @@ class WindowFrameSource:
         return int(w.left), int(w.top), int(w.width), int(w.height)
 
     def grab(self) -> Image.Image:
-        if sys.platform != "win32" and platform.system() == "Darwin":
-            self.warning = "window capture on macOS falls back to full screen"
+        # Window bounds: pygetwindow on Windows; macOS/Linux fall back to full screen
+        # (Quartz/X11 helpers are optional — full-screen share is the reliable demo path).
+        if sys.platform != "win32":
+            if platform.system() == "Darwin":
+                self.warning = "window capture on macOS falls back to full screen"
+            else:
+                self.warning = "window capture on this OS falls back to full screen"
             return self.fallback.grab()
 
-        rect = self._find_rect_windows() if sys.platform == "win32" else None
+        rect = self._find_rect_windows()
         if rect is None:
             return self.fallback.grab()
 
