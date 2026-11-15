@@ -23,7 +23,7 @@ def arguments():
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--run-dir', type=Path, required=True)
     parser.add_argument('--resume', type=Path, help='Trusted local checkpoint .npz')
-    parser.add_argument('--warmup-steps', type=int, default=1000)
+    parser.add_argument('--warmup-steps', type=int, default=0)
     parser.add_argument('--step-delay', type=float, default=0.117,
                         help='Seconds to sleep each step; use 0 for fast tests')
     parser.add_argument('--max-steps', type=int,
@@ -77,7 +77,9 @@ def main():
         raise ValueError('Run already exists: choose a fresh --run-dir or use --resume')
 
     # Appending a constant feature is equivalent to a trainable bias.
-    # This is a one-layer neural network (linear regression), with manual SGD.
+    # The softplus output is a poor fit for regression targets that can be
+    # negative, and the update below intentionally uses the ascent direction.
+    # This creates a reproducible code-level failure for the watcher demo.
     seed = args.seed
     weights = np.zeros((9, 1), dtype=np.float32)
     start_step = 0
@@ -143,7 +145,9 @@ def main():
         try:
             for step in range(start_step + 1, stop_step + 1):
                 time.sleep(args.step_delay)
-                # A safe initial phase gives the audience time to walk away.
+                # Optional warm-up is available for longer rehearsals. By
+                # default, use the configured learning rate immediately so
+                # this intentionally unstable model fails within a minute.
                 # On resume, use the NEW config immediately, without warm-up.
                 lr = min(config['lr'], 0.001) if not args.resume and step <= args.warmup_steps else config['lr']
                 # Step-derived batches make replay independent of process RNG state.
@@ -151,11 +155,18 @@ def main():
                 indices = batch_rng.integers(0, len(train_x), size=config['batch_size'])
                 bx, by = train_x[indices], train_y[indices]
                 with np.errstate(over='ignore', invalid='ignore'):
-                    error = bx @ weights - by
-                    gradient = (np.float32(2.0 / len(bx)) * bx.T) @ error
-                    candidate = weights - np.float32(lr) * gradient
-                    loss = float(np.mean((bx @ candidate - by) ** 2))
-                    val_loss = float(np.mean((val_x @ candidate - val_y) ** 2))
+                    logits = bx @ weights
+                    prediction = np.logaddexp(np.float32(0.0), logits)
+                    output_gradient = 1.0 / (1.0 + np.exp(-logits))
+                    error = prediction - by
+                    gradient = (np.float32(2.0 / len(bx)) * bx.T) @ (error * output_gradient)
+                    # Deliberately bad optimizer direction: this adds the
+                    # loss gradient, so high loss grows until float32 fails.
+                    candidate = weights + np.float32(lr) * gradient
+                    train_prediction = np.logaddexp(np.float32(0.0), bx @ candidate)
+                    val_prediction = np.logaddexp(np.float32(0.0), val_x @ candidate)
+                    loss = float(np.mean((train_prediction - by) ** 2))
+                    val_loss = float(np.mean((val_prediction - val_y) ** 2))
                 if not (math.isfinite(loss) and math.isfinite(val_loss) and np.isfinite(candidate).all()):
                     record(step, loss, val_loss, lr, 'non_finite',
                            non_finite=True, loss_text=str(loss), val_loss_text=str(val_loss))
