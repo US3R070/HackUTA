@@ -72,12 +72,14 @@ def watch(command, run_dir, cwd=None, config=None, poll=0.1, plateau_steps=0, mi
     process = None
     interrupted = False
     lock_path = run_dir / '.watcher.lock'
+    
     # Exclusive creation prevents two watcher launches writing the same run.
     try:
         lock = lock_path.open('x', encoding='utf-8')
     except FileExistsError:
         raise RuntimeError(f'Watcher lock exists: {lock_path}. Check for a running watcher before removing a stale lock.')
     
+
     with lock:
         lock.write(str(os.getpid()))
     try:
@@ -107,12 +109,15 @@ def watch(command, run_dir, cwd=None, config=None, poll=0.1, plateau_steps=0, mi
                                     config=config or {}, git_diff=None, triage=None,
                                     status='open', watcher_session=session, command=command,
                                     severity='LOW' if kind == 'plateau' else 'HIGH', evidence=[])
+                
                 if changed:
                     incident['type'] = kind
                     incident['severity'] = 'LOW' if kind == 'plateau' else 'HIGH'
+                
                 if evidence not in incident['evidence']:
                     incident['evidence'].append(evidence)
                 persist()
+                
                 if changed:
                     log(f'[watcher] INCIDENT {incident["id"]} {incident["type"]} severity={incident["severity"]}')
                     if on_incident:
@@ -124,10 +129,13 @@ def watch(command, run_dir, cwd=None, config=None, poll=0.1, plateau_steps=0, mi
             def read_metrics():
                 for row in tail.read():
                     metrics.append(row)
+                    
                     if non_finite(row):
                         detect('nan', 'Non-finite metric')
+                    
                     elif plateau.update(row):
                         detect('plateau', 'No sufficient loss improvement within configured step window')
+                
                 for error in tail.errors:
                     log(f'[watcher] Skipped malformed metric: {error}')
                 persist()
@@ -143,10 +151,12 @@ def watch(command, run_dir, cwd=None, config=None, poll=0.1, plateau_steps=0, mi
             def consume(name, line):
                 if line is None:
                     return
+                
                 annotated = f'[{name}] {line}'
                 logs.append(annotated)
                 log(annotated)
                 kind = log_failure(line)
+                
                 if kind:
                     detect(kind, f'{name} reports {kind}')
 
@@ -158,11 +168,13 @@ def watch(command, run_dir, cwd=None, config=None, poll=0.1, plateau_steps=0, mi
                 logs.append(str(exc))
                 detect('crash', 'Unable to launch training subprocess')
                 return 1
+            
             threads = []
             for name, stream in [('stdout', process.stdout), ('stderr', process.stderr)]:
                 thread = threading.Thread(target=pump, args=(stream, name), daemon=True)
                 thread.start()
                 threads.append(thread)
+            
             log(f'[watcher] Started pid={process.pid}; metrics={tail.path}')
             try:
                 # Separate pipe readers avoid deadlocks when stderr is busy.
@@ -181,25 +193,31 @@ def watch(command, run_dir, cwd=None, config=None, poll=0.1, plateau_steps=0, mi
                 interrupted = True
                 log('[watcher] Interrupted; stopping the owned training process')
                 process.terminate()
+            
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
+            
             for thread in threads:
                 thread.join(timeout=2)
             while not events.empty():
                 consume(*events.get_nowait())
+            
             read_metrics()  # Catch metrics flushed just before process exit.
             code = process.wait()
             if code != 0 and not interrupted:
                 detect('crash', f'Training exited with code {code}')
+            
             if incident:
                 incident['process_exit_code'] = code
                 persist()
+            
             atomic_json(run_dir / f'watcher-result-{session}.json', dict(
                 exit_code=code, interrupted=interrupted,
                 incident_id=incident['id'] if incident else None))
+            
             log(f'[watcher] Finished exit_code={code}; incident={incident["id"] if incident else "none"}')
             return 130 if interrupted else code
     finally:
@@ -210,6 +228,7 @@ def watch(command, run_dir, cwd=None, config=None, poll=0.1, plateau_steps=0, mi
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
+        
         lock_path.unlink(missing_ok=True)
 
 
