@@ -38,6 +38,7 @@ class Incident(BaseModel):
     git_diff: str = ""
     triage: Optional[Triage] = None
     status: Status = "open"
+    source: dict[str, str] = Field(default_factory=dict)
 
     def default_severity(self) -> Severity:
         return "HIGH" if self.type in ("nan", "crash", "oom") else "LOW"
