@@ -17,6 +17,6 @@ startup_timeout_sec = 30
 tool_timeout_sec = 60
 tool_timeouts = { get_human_response = 60 }
 # live = real Chert/LiveKit call. Use mock for offline MCP tests.
-# AGENT_IDLE_TONE=0: silence between Mentor turns (continuous tone sounded like static).
-# FACETIME_AUDIO_GRACE_S: short wait AFTER answer before Mentor greets (video warmup).
-env = { ESCALATION_MODE = "live", AGENT_IDLE_TONE = "0", FACETIME_AUDIO_GRACE_S = "1.0", PYTHONPATH = "${HACKUTA_ROOT:-.}", PYTHONUTF8 = "1" }
+# AGENT_IDLE_TONE=1: quiet tone from bridge join; Chert keeps video black on pure silence.
+# FACETIME_AUDIO_GRACE_S=0: greet as soon as phone audio arrives (raise to 0.5 if greeting clips).
+env = { ESCALATION_MODE = "live", AGENT_IDLE_TONE = "1", FACETIME_AUDIO_GRACE_S = "0", PYTHONPATH = "${HACKUTA_ROOT:-.}", PYTHONUTF8 = "1" }

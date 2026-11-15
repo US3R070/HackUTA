@@ -1,4 +1,4 @@
-"""FastMCP stdio server exposing the five escalation tools."""
+"""FastMCP stdio server exposing the escalation tools."""
 
 from __future__ import annotations
 
@@ -93,11 +93,27 @@ async def set_screen_view(incident_id: str, view: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def speak_to_caller(incident_id: str, text: str) -> dict[str, Any]:
-    """Speak a short line on the live FaceTime call (ElevenLabs TTS).
+async def fix_done(
+    incident_id: str,
+    summary: str,
+    applied: bool = True,
+) -> dict[str, Any]:
+    """Report a finished change to the caller after an approve/instruction decision.
 
-    Use after applying a fix ("There we go, I fixed it…") and again for goodbye
-    before end_escalation. Returns duration_s — wait that long before hanging up.
+    The live voice agent is waiting on this: it explains `summary` to the caller.
+    Write 1-2 plain sentences: what you changed (file + old -> new value), why
+    that value, and what the caller should see next. applied=False if you
+    refused or could not make the change (say why in summary).
+    """
+    return await sess.fix_done(incident_id, summary, applied)
+
+
+@mcp.tool()
+async def speak_to_caller(incident_id: str, text: str) -> dict[str, Any]:
+    """Speak one line on the call via plain TTS. ONLY when no voice agent is live.
+
+    With the FaceTime voice agent running, do not use this; use fix_done and let
+    the agent talk. Returns duration_s.
     """
     return await sess.speak_to_caller(incident_id, text)
 
@@ -110,12 +126,33 @@ async def end_escalation(
 ) -> dict[str, Any]:
     """Finish the escalation: final report, stop screen share, leave room.
 
-    Speak goodbye with speak_to_caller first and wait duration_s before calling this.
+    With the voice agent live, call this after get_human_response returns
+    decision="hangup" (the agent already said goodbye and ended the call).
     """
     return await sess.end_escalation(incident_id, outcome, summary)
 
 
+def _exit_when_orphaned() -> None:
+    """Exit if the parent (Grok) dies; otherwise we linger holding port 8765."""
+    import os
+    import threading
+    import time
+
+    parent = os.getppid()
+
+    def _watch() -> None:
+        while True:
+            time.sleep(2.0)
+            # Reparented (to launchd/init = PID 1) means the client is gone.
+            if os.getppid() != parent or os.getppid() == 1:
+                logger.warning("parent process %s exited; escalation MCP shutting down", parent)
+                os._exit(0)
+
+    threading.Thread(target=_watch, name="orphan-watchdog", daemon=True).start()
+
+
 def main() -> None:
+    _exit_when_orphaned()
     # Configure runtime from env before serving
     sess.configure_runtime()
     logger.info(

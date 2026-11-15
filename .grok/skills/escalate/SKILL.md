@@ -21,24 +21,22 @@ Do **not** escalate trivial errors you can fix safely yourself.
 
 ## Protocol
 
-1. Call `escalate_failure` **once** with a speakable `summary` (<15s), `severity` (`LOW`|`HIGH`), `details`, and `proposed_fix` if any. Prefer `share="screen"` for the phone demo (or `window:<title>` on Windows for privacy).
+1. Call `escalate_failure` **once** with a speakable `summary` (<15s), `severity` (`LOW`|`HIGH`), `proposed_fix`, and `details` that include a `rationale`: why this is the cause and why this exact fix/value is right (the voice agent explains this to the human). Prefer `share="screen"` for the phone demo (or `window:<title>` on Windows for privacy).
 2. Narrate with `report_action` **before and after every meaningful step** (read file, run command, edit, test).
-3. **Autonomous wait (required):** Right after `escalate_failure`, enter a loop and call `get_human_response(wait_seconds=25)` repeatedly until you get a real decision (`approve` / `reject` / `stop` / `instruction`). Do **not** stop and ask the TUI user what to do next — the human is on the phone; their yes/no arrives via this tool (from the Mentor voice bridge).
-   - On `none`: loop again immediately.
-   - On `approve`: apply the proposed fix quickly, `report_action` started/done, then **speak on the call** (see below), then `end_escalation`.
-   - On `reject`: do not edit; one short abort line via `speak_to_caller`; `end_escalation(outcome="aborted")`.
-   - On `stop`: halt, revert uncommitted edits from this incident, one goodbye; `end_escalation(outcome="aborted")`.
-   - On `instruction`: follow if safe; `report_action`; then keep looping for further decisions until approve/reject/stop.
-4. Never treat silence / `none` as approval.
-5. Use `set_screen_view` so the human sees what they need (traceback terminal, diff, rendered plot via `image:<path>`).
-6. **Repo boundary (this HackUTA demo):** config fixes may edit `demo/configs/*.yaml` in this repo. For a separate train repo, use branch `agent/fix-<incident_id>` there instead. Never push or merge without approval.
-7. **Call script (phone live):** the voice bridge already plays a short “on it…” filler when approve is queued — do **not** add another thinking line.
-   After the fix:
-   1. `speak_to_caller`: `"Okay — it's fixed. Is there anything else you need?"` — wait `duration_s`
-   2. `get_human_response(wait_seconds=8)` **once only** — never poll again after this
-   3. On `none` / no / nothing else: `speak_to_caller` **once**: `"Sounds good. Hanging up — good luck with the run."` — wait `duration_s` — `end_escalation(outcome="resolved")` immediately
-   Never repeat the goodbye. Never ask “are you still there?” Never say hang-up twice.
-8. Only after `end_escalation` may you return control to the TUI user.
+3. **The voice agent owns the call.** A live voice agent (Mentor) greets, explains, answers questions, says goodbye and hangs up. You never speak: do **not** use `speak_to_caller` while it is live.
+4. **Autonomous wait (required):** right after `escalate_failure`, loop `get_human_response(wait_seconds=25)` until the call ends. Do **not** stop and ask the TUI user what to do — the human is on the phone; decisions arrive via this tool.
+   - `none`: loop again immediately.
+   - `approve`: apply the proposed fix **quickly** (the human is waiting on the line), `report_action` started/done, then `fix_done(incident_id, summary, applied=True)`. Keep looping.
+   - `instruction`: follow it if safe, then `fix_done` with what you changed and why (or `applied=False` with the reason). Keep looping.
+   - `reject`: do not edit. Keep looping.
+   - `stop`: halt and revert uncommitted edits from this incident. Keep looping.
+   - `hangup`: the call is over. `end_escalation(outcome="resolved"` if you applied a fix, else `"aborted"`, `summary=...)`, then return control.
+5. **`fix_done` summary:** 1–2 plain sentences the voice agent will explain: what changed (file, old → new value), why that value, what the human should see next. Example: "Changed lr from 5.0 to 3e-4 in the bad-LR config; updates stay small and stable, so loss should drop smoothly within ~100 steps."
+6. Never treat silence / `none` as approval.
+7. Use `set_screen_view` so the human sees what they need (traceback terminal, diff, rendered plot via `image:<path>`).
+8. **Repo boundary (this HackUTA demo):** config fixes may edit `demo/configs/*.yaml` in this repo. For a separate train repo, use branch `agent/fix-<incident_id>` there instead. Never push or merge without approval.
+9. Only after `end_escalation` may you return control to the TUI user.
+10. **No voice agent** (mock mode, or the escalation result warns voice failed): fall back to one `speak_to_caller` line after the fix and before `end_escalation`.
 
 Long commands: run them in the background and poll `get_human_response` — MCP cannot interrupt mid-command.
 
@@ -50,19 +48,17 @@ escalate_failure(
   summary="Loss became NaN at step 4200. Learning rate 5.0 looks too high.",
   failure_type="nan",
   severity="HIGH",
-  details={"log_tail": ["step=4200 loss=nan lr=5.0"], "config": {"lr": 5.0}},
+  details={"log_tail": ["step=4200 loss=nan lr=5.0"], "config": {"lr": 5.0},
+           "rationale": "lr=5.0 overshoots every step so loss diverges to inf then NaN; 3e-4 is the standard Adam default, ~16,000x smaller, stable but still fast."},
   proposed_fix="Lower lr to 3e-4 and resume from the step-4000 checkpoint.",
-  share="window:PowerShell"
+  share="screen"
 )
-
-report_action(incident_id, "read_file", "configs/bad_lr.yaml", "started")
-report_action(incident_id, "read_file", "configs/bad_lr.yaml", "done")
-get_human_response(incident_id, wait_seconds=0)  # -> none
-
-report_action(incident_id, "propose_edit", "lr 5.0 -> 3e-4", "started")
+report_action(incident_id, "screen_share", "live", "done")
+get_human_response(incident_id, wait_seconds=25)  # -> none
 get_human_response(incident_id, wait_seconds=25)  # -> approve
-report_action(incident_id, "edit_file", "configs/bad_lr.yaml", "done")
-
-set_screen_view(incident_id, "image:runs/loss_after.png")
+report_action(incident_id, "edit_file", "configs/bad_lr.yaml", "started")
+report_action(incident_id, "edit_file", "lr 5.0 -> 3e-4", "done")
+fix_done(incident_id, "Changed lr from 5.0 to 3e-4 in bad_lr.yaml; updates stay stable, so loss should drop smoothly within ~100 steps.")
+get_human_response(incident_id, wait_seconds=25)  # -> hangup (agent said goodbye)
 end_escalation(incident_id, "resolved", "Lowered lr to 3e-4; ready to resume.")
 ```

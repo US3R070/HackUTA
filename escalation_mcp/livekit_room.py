@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from datetime import timedelta
 from typing import Any, Awaitable, Callable, Optional
 
@@ -86,14 +87,39 @@ class LiveKitRoomConnection:
         self._pump_task: asyncio.Task[None] | None = None
         self._audio_stream_tasks: list[asyncio.Task[None]] = []
         self._user_audio_sink: UserAudioSink | None = None
-        # Idle tone keeps FaceTime video alive between turns, but sounds like
-        # static before the agent greets — leave off until first real speech.
+        # Idle tone keeps FaceTime video alive. Chert shows black video while the
+        # agent track is pure silence, so it is switched on when the bridge joins
+        # (see _on_participant) rather than waiting for the first agent speech.
         self._idle_enabled = False
         self.bridge_joined = asyncio.Event()
         # Set when we receive the first audio frame from Chert (call answered).
         self.remote_audio_started = asyncio.Event()
         self._bridge_joined_hooks: list[Callable[[], None]] = []
         self._call_answered_hooks: list[Callable[[], None]] = []
+        self._bridge_left_hooks: list[Callable[[], None]] = []
+        # Startup latency instrumentation: event name -> monotonic time.
+        self._marks: dict[str, float] = {}
+        # Monotonic time the pump last sent a real (non-idle) agent frame.
+        self._last_agent_frame = 0.0
+
+    def agent_speaking(self, tail_s: float = 0.35) -> bool:
+        """True while agent speech is queued/playing, plus a short echo tail."""
+        if not self._audio_q.empty():
+            return True
+        return time.monotonic() - self._last_agent_frame < tail_s
+
+    def mark(self, event: str) -> None:
+        """Log a call-timeline event once, with deltas from connect and answer."""
+        if event in self._marks:
+            return
+        now = time.monotonic()
+        self._marks[event] = now
+        parts = [f"[timing] {event}"]
+        for ref in ("connected", "bridge_joined", "answered"):
+            t = self._marks.get(ref)
+            if t is not None and ref != event:
+                parts.append(f"+{now - t:.2f}s since {ref}")
+        logger.info(" · ".join(parts))
 
     @property
     def connected(self) -> bool:
@@ -130,6 +156,11 @@ class LiveKitRoomConnection:
         if hook not in self._call_answered_hooks:
             self._call_answered_hooks.append(hook)
 
+    def add_bridge_left_hook(self, hook: Callable[[], None]) -> None:
+        """Called when Chert's bridge leaves the room (phone call ended)."""
+        if hook not in self._bridge_left_hooks:
+            self._bridge_left_hooks.append(hook)
+
     # ---- audio ----
     def play_pcm(self, pcm: bytes) -> None:
         """Queue 48 kHz mono int16 PCM (e.g. TTS output) to speak into the call."""
@@ -148,6 +179,7 @@ class LiveKitRoomConnection:
         while self._connected and self._audio_source is not None:
             try:
                 chunk = self._audio_q.get_nowait()
+                self._last_agent_frame = time.monotonic()
             except asyncio.QueueEmpty:
                 chunk = IDLE if (IDLE_TONE and self._idle_enabled) else SILENCE
             try:
@@ -179,14 +211,30 @@ class LiveKitRoomConnection:
         def _on_participant(p: Any) -> None:
             if getattr(p, "identity", "") == BRIDGE_IDENTITY:
                 self.bridge_joined.set()
-                # Short wake chirp helps Chert attach the video track sooner.
-                logger.info("Chert bridge joined; wake chirp for video")
+                self.mark("bridge_joined")
+                # Short wake chirp helps Chert attach the video track sooner;
+                # continuous idle tone afterwards keeps video from going black
+                # in the gap between answer and the agent's first words.
+                logger.info("Chert bridge joined; wake chirp + idle tone for video")
                 self.play_pcm(CHIME)
+                self._idle_enabled = True
                 for hook in list(self._bridge_joined_hooks):
                     try:
                         hook()
                     except Exception:  # noqa: BLE001
                         logger.exception("bridge_joined hook failed")
+
+        @self.room.on("participant_disconnected")
+        def _on_participant_left(p: Any) -> None:
+            if getattr(p, "identity", "") != BRIDGE_IDENTITY or not self._connected:
+                return
+            logger.info("Chert bridge left the room (phone call ended)")
+            self.mark("bridge_left")
+            for hook in list(self._bridge_left_hooks):
+                try:
+                    hook()
+                except Exception:  # noqa: BLE001
+                    logger.exception("bridge_left hook failed")
 
         @self.room.on("track_subscribed")
         def _on_track_subscribed(track: Any, publication: Any, participant: Any) -> None:
@@ -205,6 +253,8 @@ class LiveKitRoomConnection:
 
         await self.room.connect(self.settings.livekit_url, token)
         self._connected = True
+        self._marks.clear()
+        self.mark("connected")
 
         # agent audio track (required by Chert's bridge)
         self._audio_source = rtc.AudioSource(SR, CH)
@@ -236,6 +286,7 @@ class LiveKitRoomConnection:
                     saw_frame = True
                     if not self.remote_audio_started.is_set():
                         logger.info("first remote audio frame — call media is live")
+                        self.mark("answered")
                         self.remote_audio_started.set()
                         for hook in list(self._call_answered_hooks):
                             try:

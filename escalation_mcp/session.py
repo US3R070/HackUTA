@@ -480,11 +480,34 @@ async def _start_voice_bridge(packet: Any) -> None:
     room_conn = RUNTIME.room_conn
     if room_conn is None:
         return
+
+    # Caller hung up on their end: tell Grok right away instead of letting it
+    # wait on decisions that will never come.
+    loop = asyncio.get_running_loop()
+    incident_id = getattr(packet, "incident_id", "")
+    room_conn.add_bridge_left_hook(
+        lambda: loop.create_task(hangup_from_agent(incident_id, reason="caller_hung_up"))
+    )
+
     try:
         await asyncio.wait_for(room_conn.bridge_joined.wait(), timeout=90.0)
     except asyncio.TimeoutError:
         logger.warning("ElevenLabs bridge: Chert bridge never joined; skipping voice")
         return
+
+    # Do the slow setup (SDK import, signed URL) while the phone rings, so the
+    # only work left after answer is opening the websocket.
+    bridge = None
+    try:
+        from escalation_mcp.voice.eleven_agent import ElevenAgentBridge
+
+        bridge = ElevenAgentBridge(
+            room_conn, packet, loop=asyncio.get_running_loop()
+        )
+        await bridge.prepare()
+        room_conn.mark("eleven_prepared")
+    except Exception:  # noqa: BLE001
+        logger.exception("ElevenLabs prepare during ringing failed; will retry on answer")
 
     try:
         logger.info("ElevenLabs bridge: waiting for answered FaceTime audio…")
@@ -494,7 +517,10 @@ async def _start_voice_bridge(packet: Any) -> None:
             "ElevenLabs bridge: no remote audio (call unanswered?); starting anyway"
         )
 
-    grace = float(os.getenv("FACETIME_AUDIO_GRACE_S") or "2.0")
+    # Idle tone now keeps video alive from bridge join, so no fixed wait is
+    # needed by default. Bump FACETIME_AUDIO_GRACE_S if the greeting's first
+    # words get clipped on the phone.
+    grace = float(os.getenv("FACETIME_AUDIO_GRACE_S") or "0")
     if grace > 0:
         logger.info(
             "ElevenLabs bridge: +%.1fs after answer for FaceTime video attach", grace
@@ -502,11 +528,12 @@ async def _start_voice_bridge(packet: Any) -> None:
         await asyncio.sleep(grace)
 
     try:
-        from escalation_mcp.voice.eleven_agent import ElevenAgentBridge
+        if bridge is None:
+            from escalation_mcp.voice.eleven_agent import ElevenAgentBridge
 
-        bridge = ElevenAgentBridge(
-            room_conn, packet, loop=asyncio.get_running_loop()
-        )
+            bridge = ElevenAgentBridge(
+                room_conn, packet, loop=asyncio.get_running_loop()
+            )
         await bridge.start()
         RUNTIME.voice_bridge = bridge
     except Exception as exc:  # noqa: BLE001
@@ -584,6 +611,76 @@ async def set_screen_view(incident_id: str, view: str) -> dict[str, Any]:
     if warnings:
         result["warnings"] = warnings
     return result
+
+
+async def fix_done(incident_id: str, summary: str, applied: bool = True) -> dict[str, Any]:
+    """Grok reports a finished (or refused) change; the voice agent explains it."""
+    incident = STATE.require(incident_id)
+    summary = (summary or "").strip() or ("Change applied." if applied else "No change made.")
+    await report_action(
+        incident_id, "fix_done" if applied else "fix_skipped", summary[:160], "done"
+    )
+    bridge = RUNTIME.voice_bridge
+    if bridge is not None:
+        delivered = bridge.on_fix_done(summary, applied)
+    else:
+        # No live voice agent (mock / voice failed): fall back to one TTS line.
+        spoken = await speak_to_caller(incident_id, summary)
+        delivered = "tts" if spoken.get("ok") else "none"
+    append_agent_log(
+        incident_id,
+        {
+            "ts": _utc_now_iso(),
+            "tool": "fix_done",
+            "applied": applied,
+            "summary": summary[:300],
+            "delivered": delivered,
+        },
+    )
+    logger.info("fix_done (%s) delivered via %s: %s", applied, delivered, summary[:120])
+    return {"ok": True, "delivered": delivered, "incident_id": incident.incident_id}
+
+
+async def hangup_from_agent(incident_id: str, reason: str = "agent_end_call") -> dict[str, Any]:
+    """End the phone call now (voice agent said goodbye, or caller hung up).
+
+    Ends the Chert call immediately and queues a "hangup" decision so Grok's
+    get_human_response returns it; Grok then calls end_escalation for the
+    final report/teardown (idempotent).
+    """
+    active = await STATE.get_active()
+    if not active or active.incident_id != incident_id:
+        return {"ok": False, "error": "not active"}
+    if active.hung_up:
+        return {"ok": True, "already": True}
+    active.hung_up = True
+
+    report = FinalReport(
+        outcome="resolved",
+        summary=f"call ended ({reason})",
+        ended_at=_utc_now_iso(),
+        actions=[a.model_dump(by_alias=True) for a in active.actions],
+    )
+    try:
+        await RUNTIME.sink.send_report(incident_id, report)
+    except Exception:  # noqa: BLE001
+        logger.exception("ending phone call failed")
+
+    # Bypass enqueue_decision (it drops "hangup" as a lifecycle signal).
+    await active.decision_queue.put(
+        HumanDecision.model_validate(
+            {
+                "incident_id": incident_id,
+                "ts": _utc_now_iso(),
+                "decision": "hangup",
+                "text": reason,
+                "from": "facetime-mentor",
+            }
+        )
+    )
+    append_agent_log(incident_id, {"ts": _utc_now_iso(), "tool": "hangup", "reason": reason})
+    logger.info("phone call ended for %s (%s)", incident_id, reason)
+    return {"ok": True}
 
 
 async def speak_to_caller(incident_id: str, text: str) -> dict[str, Any]:

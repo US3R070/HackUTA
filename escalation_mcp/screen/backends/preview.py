@@ -121,10 +121,15 @@ class PreviewBackend(ScreenBackend):
                 last_err = exc
                 await asyncio.sleep(0.15)
         else:
-            raise RuntimeError(
-                f"could not bind preview to {self.host}:{self.port} "
-                f"(locked port; stop the previous preview first): {last_err}"
+            # Usually a stale escalation MCP still holds the port. The preview
+            # is only a local debug view, so take any free port instead of failing.
+            logger.warning(
+                "preview port %s busy (%s); falling back to a free port. "
+                "Find the holder with: lsof -nP -iTCP:%s -sTCP:LISTEN",
+                self.port, last_err, self.port,
             )
+            self._httpd = _PreviewServer((self.host, 0), Handler)
+            self.port = self._httpd.server_address[1]
 
         self.preview_url = f"http://{self.host}:{self.port}"
         self._thread = threading.Thread(

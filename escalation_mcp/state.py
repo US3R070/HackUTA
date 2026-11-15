@@ -52,6 +52,8 @@ class ActiveIncident:
     last_decision: HumanDecision | None = None
     # Set by end_escalation while the call is still live (agent done, human watching).
     agent_outcome: tuple[str, str] | None = None
+    # Phone call already ended (agent end_call or caller hung up).
+    hung_up: bool = False
 
 
 class EscalationState:

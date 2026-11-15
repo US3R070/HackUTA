@@ -7,11 +7,18 @@ Client tool send_to_grok → HumanDecision → Allen's decision queue for Grok M
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
 import threading
+import time
+import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional
+
+import numpy as np
 
 from escalation_mcp.models import EscalationPacket, HumanDecision
 from escalation_mcp.state import STATE
@@ -27,6 +34,15 @@ LK_SR = 48_000
 # ElevenLabs recommends ~250 ms chunks at 16 kHz mono PCM16.
 EL_CHUNK_SAMPLES = 4_000
 EL_CHUNK_BYTES = EL_CHUNK_SAMPLES * 2
+# Only inject keep-alive silence when no real phone audio has arrived for this
+# long. Mixing silence blocks into live phone audio doubles the uplink rate and
+# splices gaps into speech, which wrecks ElevenLabs VAD / turn-taking.
+REAL_AUDIO_GAP_S = 0.3
+GATE_LOG_EVERY_S = 5.0
+# How long send_to_grok(approve|instruction) waits for Grok's fix_done before
+# returning "still working". Keep below the tool's response timeout in the
+# ElevenLabs dashboard.
+FIX_WAIT_S = float(os.getenv("MENTOR_FIX_WAIT_S") or "40")
 
 _VALID = frozenset({"approve", "reject", "stop", "instruction"})
 
@@ -55,6 +71,13 @@ def incident_context(packet: EscalationPacket) -> str:
         tail = str(log_tail)[:800]
     tb = str(details.get("traceback") or "")[:600]
     cfg = details.get("config")
+    rationale = details.get("rationale") or "(none given; reason from the summary and logs)"
+    extra = {
+        k: v
+        for k, v in details.items()
+        if k not in {"log_tail", "traceback", "config", "rationale"}
+    }
+    extra_s = json.dumps(extra, default=str)[:800] if extra else "(none)"
     return (
         f"incident_id: {packet.incident_id}\n"
         f"title: {packet.title}\n"
@@ -62,36 +85,131 @@ def incident_context(packet: EscalationPacket) -> str:
         f"severity: {packet.severity}\n"
         f"summary: {packet.summary}\n"
         f"proposed_fix: {packet.proposed_fix or '(none)'}\n"
+        f"rationale (why this cause, why this exact fix/value): {rationale}\n"
         f"run_id: {packet.run_id or '(none)'}\n"
         f"config: {cfg}\n"
+        f"other details: {extra_s}\n"
         f"log_tail:\n{tail}\n"
         f"traceback:\n{tb}\n"
     )
 
 
+_PROMPT_PATH = Path(__file__).resolve().parents[2] / "skills" / "mentor_voice.md"
+
+
 def mentor_prompt_with_context(packet: EscalationPacket) -> str:
-    return (
-        "You are Mentor on a FaceTime call about a failed ML training run.\n"
-        "Be calm, brief, and concrete. Explain the problem in one or two sentences, "
-        "ask if they want the proposed fix, and wait for a clear yes/no or instruction.\n"
-        "When the human approves, rejects, asks to stop, or gives an instruction, "
-        "call the send_to_grok tool. Do not claim you edited code yourself.\n"
-        "After send_to_grok succeeds: stay completely silent. Do not check if they are "
-        "still there, do not ask if they need anything else, do not say goodbye.\n\n"
-        "INCIDENT CONTEXT:\n"
-        f"{incident_context(packet)}"
-    )
+    """Full system prompt: repo-owned persona/rules + this incident's context."""
+    try:
+        persona = _PROMPT_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        logger.warning("mentor prompt missing at %s; using minimal prompt", _PROMPT_PATH)
+        persona = (
+            "You are Mentor, a friendly ML engineer on a FaceTime call about a failed "
+            "training run. Be brief and conversational. Use send_to_grok for decisions "
+            "and end_call when the caller is done."
+        )
+    return f"{persona}\n\n## INCIDENT CONTEXT\n{incident_context(packet)}"
 
 
 def first_message_for(packet: EscalationPacket) -> str:
-    fix = packet.proposed_fix or "a safe fix"
-    summary = (packet.summary or packet.title or "a training failure").strip()
-    if len(summary) > 180:
-        summary = summary[:177] + "…"
+    """Spoken verbatim by TTS, so no file paths or raw numbers like 3e-4."""
+    summary = (packet.summary or packet.title or "your training run failed").strip()
+    first = re.split(r"(?<=[.!?])\s+", summary, maxsplit=1)[0].rstrip(".!?")
+    if len(first) > 120:
+        first = first[:117] + "…"
     return (
-        f"Hey — {summary} "
-        f"I can apply this: {fix}. Want me to go ahead?"
+        f"Hey, it's Mentor. Heads up, {first[0].lower() + first[1:] if first else 'your run broke'}. "
+        "I think I know why, and I've got a fix ready. "
+        "Want me to walk you through it, or just apply it?"
     )
+
+
+def _rms(pcm: bytes) -> float:
+    samples = np.frombuffer(pcm, dtype=np.int16)
+    if samples.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name) or default)
+    except ValueError:
+        return default
+
+
+class VoiceGate:
+    """Replace quiet phone audio (distant room chatter) with silence.
+
+    Two thresholds (int16 RMS): a normal one, and a higher "barge-in" one while
+    the agent is talking, so only someone close to the phone mic can interrupt.
+    Once open, the gate holds briefly so word tails and soft consonants pass.
+    Silence (not dropped audio) keeps the uplink continuous for ElevenLabs.
+
+    Env: VOICE_GATE=0 disables; VOICE_GATE_RMS, VOICE_GATE_BARGE_RMS,
+    VOICE_GATE_HOLD_S, VOICE_GATE_BARGE_ATTACK_S tune it. Periodic
+    "voice gate:" log lines show live levels for calibration.
+    """
+
+    def __init__(self, is_agent_speaking: Callable[[], bool]) -> None:
+        self.enabled = os.getenv("VOICE_GATE", "1") != "0"
+        self.open_rms = _env_float("VOICE_GATE_RMS", 500.0)
+        self.barge_rms = _env_float("VOICE_GATE_BARGE_RMS", 1400.0)
+        self.hold_s = _env_float("VOICE_GATE_HOLD_S", 0.45)
+        self.barge_attack_s = _env_float("VOICE_GATE_BARGE_ATTACK_S", 0.06)
+        self._agent_speaking = is_agent_speaking
+        self._open_until = 0.0
+        self._loud_run_s = 0.0
+        self._reset_stats(time.monotonic())
+
+    def _reset_stats(self, now: float) -> None:
+        self._stat_t0 = now
+        self._levels: list[float] = []
+        self._passed_s = 0.0
+        self._total_s = 0.0
+        self._agent_s = 0.0
+
+    def process(self, pcm: bytes) -> bytes:
+        if not self.enabled or not pcm:
+            return pcm
+        now = time.monotonic()
+        dur = len(pcm) / (2.0 * EL_SR)
+        level = _rms(pcm)
+        try:
+            agent = bool(self._agent_speaking())
+        except Exception:  # noqa: BLE001
+            agent = False
+
+        threshold = self.barge_rms if agent else self.open_rms
+        if level >= threshold:
+            self._loud_run_s += dur
+            attack = self.barge_attack_s if agent else 0.0
+            if self._loud_run_s >= attack:
+                self._open_until = now + self.hold_s
+        else:
+            self._loud_run_s = 0.0
+        is_open = now < self._open_until
+
+        self._levels.append(level)
+        self._total_s += dur
+        self._passed_s += dur if is_open else 0.0
+        self._agent_s += dur if agent else 0.0
+        if now - self._stat_t0 >= GATE_LOG_EVERY_S and self._levels:
+            arr = np.asarray(self._levels)
+            logger.info(
+                "voice gate: rms p50=%d p90=%d peak=%d · passed %d%% · agent talking %d%% "
+                "· thresholds open=%d barge=%d",
+                np.percentile(arr, 50),
+                np.percentile(arr, 90),
+                arr.max(),
+                100 * self._passed_s / max(self._total_s, 1e-6),
+                100 * self._agent_s / max(self._total_s, 1e-6),
+                self.open_rms,
+                self.barge_rms,
+            )
+            self._reset_stats(now)
+
+        return pcm if is_open else bytes(len(pcm))
 
 
 class LiveKitAudioInterface:
@@ -99,6 +217,7 @@ class LiveKitAudioInterface:
 
     def __init__(self, room_conn: "LiveKitRoomConnection") -> None:
         self._room = room_conn
+        self._gate = VoiceGate(getattr(room_conn, "agent_speaking", lambda: False))
         self._input_callback: Optional[Callable[[bytes], None]] = None
         self._running = False
         self._in_buf = bytearray()
@@ -107,6 +226,7 @@ class LiveKitAudioInterface:
         self._silence_thread: threading.Thread | None = None
         self._bytes_out = 0
         self._mute_agent_out = False
+        self._last_real_audio = 0.0
 
     def set_output_sample_rate(self, hz: int) -> None:
         if hz > 0:
@@ -123,7 +243,8 @@ class LiveKitAudioInterface:
         self._mute_agent_out = False
         self._in_buf.clear()
         self._bytes_out = 0
-        # Keep a silent uplink alive until FaceTime audio is subscribed.
+        self._last_real_audio = 0.0
+        # Keep a silent uplink alive whenever FaceTime audio isn't flowing.
         self._silence_thread = threading.Thread(
             target=self._feed_silence, name="el-silence-uplink", daemon=True
         )
@@ -145,6 +266,7 @@ class LiveKitAudioInterface:
             return
         self._bytes_out += len(audio)
         if self._bytes_out == len(audio):
+            self._room.mark("first_agent_audio")
             logger.info(
                 "ElevenLabs audio out: first chunk %d bytes (assuming %d Hz)",
                 len(audio),
@@ -167,6 +289,10 @@ class LiveKitAudioInterface:
 
     def push_user_pcm16_16k(self, pcm16k: bytes) -> None:
         """Feed phone/user audio (already 16 kHz mono PCM16) into ElevenLabs."""
+        self._last_real_audio = time.monotonic()
+        self._push(self._gate.process(pcm16k))
+
+    def _push(self, pcm16k: bytes) -> None:
         if not self._running or not self._input_callback or not pcm16k:
             return
         with self._lock:
@@ -185,12 +311,46 @@ class LiveKitAudioInterface:
     def _feed_silence(self) -> None:
         silence = b"\x00\x00" * EL_CHUNK_SAMPLES
         while self._running:
-            self.push_user_pcm16_16k(silence)
+            if time.monotonic() - self._last_real_audio > REAL_AUDIO_GAP_S:
+                self._push(silence)
             threading.Event().wait(EL_CHUNK_SAMPLES / float(EL_SR))
 
 
+def _agent_capabilities(agent_id: str, api_key: str) -> dict[str, Any]:
+    """Read the agent's dashboard config: which overrides are allowed, tool setup."""
+    req = urllib.request.Request(
+        f"https://api.elevenlabs.io/v1/convai/agents/{agent_id}",
+        headers={"xi-api-key": api_key, "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        data = json.loads(resp.read().decode())
+    agent_ov = (
+        ((data.get("platform_settings") or {}).get("overrides") or {})
+        .get("conversation_config_override", {})
+        .get("agent", {})
+    )
+    prompt_cfg = (
+        (data.get("conversation_config") or {}).get("agent", {}).get("prompt", {})
+    )
+    tools = {t.get("name"): t for t in (prompt_cfg.get("tools") or [])}
+    built_in = prompt_cfg.get("built_in_tools") or {}
+    return {
+        "prompt_override": bool((agent_ov.get("prompt") or {}).get("prompt")),
+        "first_message_override": bool(agent_ov.get("first_message")),
+        "send_to_grok_timeout": (tools.get("send_to_grok") or {}).get("response_timeout_secs"),
+        "end_call": bool(built_in.get("end_call")) or "end_call" in tools,
+        "skip_turn": bool(built_in.get("skip_turn")) or "skip_turn" in tools,
+    }
+
+
 class ElevenAgentBridge:
-    """Owns one ElevenLabs Conversation tied to a live escalation."""
+    """Owns one ElevenLabs Conversation for the whole live call.
+
+    The agent stays connected from greeting to goodbye. Grok only edits code:
+    send_to_grok(approve|instruction) waits for Grok's fix_done() and returns
+    the result so the agent can explain it; the agent's built-in end_call
+    hangs up the FaceTime call right after its goodbye finishes playing.
+    """
 
     def __init__(
         self,
@@ -205,14 +365,30 @@ class ElevenAgentBridge:
         self._audio = LiveKitAudioInterface(room_conn)
         self._conversation: Any = None
         self._started = False
+        self._prepared = False
+        self._stopping = False
+        self._agent_id = ""
+        self._overrides_applied = False
+        # Pending Grok result for an approve/instruction (resolved by fix_done).
+        self._fix_future: asyncio.Future[str] | None = None
 
     @property
     def audio(self) -> LiveKitAudioInterface:
         return self._audio
 
-    async def start(self) -> None:
-        if self._started:
+    async def prepare(self) -> None:
+        """Do all slow setup while the phone is still ringing.
+
+        Imports the SDK, checks the agent's dashboard config, builds the
+        Conversation and prefetches the signed websocket URL so start() only
+        has to open the socket once the call is answered.
+        """
+        if self._prepared:
             return
+        await asyncio.to_thread(self._build_conversation)
+        self._prepared = True
+
+    def _build_conversation(self) -> None:
         agent_id = _env("ELEVENLABS_AGENT_ID", "AGENT_ID")
         api_key = _env("ELEVENLABS_API_KEY", "ELEVEN_API_KEY")
         if not agent_id:
@@ -230,11 +406,42 @@ class ElevenAgentBridge:
         client_tools = ClientTools(loop=self._loop)
         client_tools.register("send_to_grok", self._send_to_grok, is_async=True)
 
-        # Free plan: first_message / prompt overrides are unavailable. Leave
-        # conversation_config_override empty and set the greeting in the
-        # ElevenLabs dashboard. Incident details go via contextual update.
+        # Prompt + greeting live in the repo (skills/mentor_voice.md) and are
+        # sent per call, if the agent allows overrides (dashboard → Security).
+        override: dict[str, Any] = {}
+        try:
+            caps = _agent_capabilities(agent_id, api_key)
+        except Exception:  # noqa: BLE001
+            logger.exception("could not read ElevenLabs agent config; sending no overrides")
+            caps = {}
+        agent_ov: dict[str, Any] = {}
+        if caps.get("prompt_override"):
+            agent_ov["prompt"] = {"prompt": mentor_prompt_with_context(self._packet)}
+        if caps.get("first_message_override"):
+            agent_ov["first_message"] = first_message_for(self._packet)
+        if agent_ov:
+            override["agent"] = agent_ov
+        self._overrides_applied = "prompt" in agent_ov
+        if caps:
+            logger.info("ElevenLabs agent capabilities: %s", caps)
+            if not caps.get("prompt_override") or not caps.get("first_message_override"):
+                logger.warning(
+                    "ElevenLabs: enable System prompt + First message overrides "
+                    "(agent → Security → Overrides) so the repo prompt and the "
+                    "per-incident greeting are used; falling back to dashboard prompt"
+                )
+            timeout = caps.get("send_to_grok_timeout") or 0
+            if timeout and timeout < FIX_WAIT_S + 2:
+                logger.warning(
+                    "ElevenLabs: send_to_grok response timeout is %ss but bridge waits "
+                    "up to %ss for Grok; raise it to ~%ds in the dashboard",
+                    timeout, FIX_WAIT_S, int(FIX_WAIT_S + 5),
+                )
+            if not caps.get("end_call"):
+                logger.warning("ElevenLabs: built-in end_call tool is off; agent can't hang up")
+
         config = ConversationInitiationData(
-            conversation_config_override={},
+            conversation_config_override=override,
             dynamic_variables={
                 "incident_id": self._packet.incident_id,
                 "summary": self._packet.summary or "",
@@ -245,7 +452,11 @@ class ElevenAgentBridge:
         )
 
         def _on_disconnect(details: Any) -> None:
+            reason = getattr(details, "reason", None)
             logger.warning("ElevenLabs disconnected: %s", details)
+            # "agent" = normal server close, e.g. the agent called end_call.
+            if reason == "agent" and not self._stopping:
+                asyncio.run_coroutine_threadsafe(self._handle_agent_ended(), self._loop)
 
         self._conversation = Conversation(
             ElevenLabs(api_key=api_key),
@@ -258,33 +469,57 @@ class ElevenAgentBridge:
             callback_user_transcript=lambda t: logger.info("caller: %s", t),
             callback_disconnect=_on_disconnect,
         )
+        self._agent_id = agent_id
+
+        # Prefetch the signed URL now; start_session() would otherwise fetch it
+        # synchronously after answer. Signed URLs stay valid ~15 minutes.
+        conv = self._conversation
+        if getattr(conv, "requires_auth", False) and hasattr(conv, "_get_signed_url"):
+            try:
+                signed_url = conv._get_signed_url()  # noqa: SLF001
+                conv._get_signed_url = lambda: signed_url  # noqa: SLF001
+                logger.info("ElevenLabs: signed URL prefetched during ringing")
+            except Exception:  # noqa: BLE001
+                logger.exception("ElevenLabs signed URL prefetch failed; will fetch on start")
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        if not self._prepared:
+            await self.prepare()
         # SDK runs the websocket on a background thread.
         await asyncio.to_thread(self._conversation.start_session)
+        self._room.mark("eleven_session_started")
         self._started = True
         self._room.set_user_audio_sink(self._audio.push_user_pcm16_16k)
 
-        # Incident details without requiring prompt-override permission.
-        context = incident_context(self._packet)
-        try:
-            await asyncio.sleep(0.8)
-            await asyncio.to_thread(
-                self._conversation.send_contextual_update,
-                f"Incident context for this call:\n{context}",
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("send_contextual_update failed")
+        if not self._overrides_applied:
+            # Dashboard prompt in use: at least give it the incident details.
+            try:
+                await asyncio.sleep(0.8)
+                await asyncio.to_thread(
+                    self._conversation.send_contextual_update,
+                    f"Incident context for this call:\n{incident_context(self._packet)}",
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("send_contextual_update failed")
 
         logger.info(
-            "ElevenLabs agent session started for %s (agent_id=%s…)",
+            "ElevenLabs agent session started for %s (agent_id=%s…, repo prompt=%s)",
             self._packet.incident_id,
-            agent_id[:12],
+            self._agent_id[:12],
+            self._overrides_applied,
         )
 
     async def stop(self) -> None:
+        self._stopping = True
         self._room.set_user_audio_sink(None)
+        if self._fix_future and not self._fix_future.done():
+            self._fix_future.cancel()
         conv = self._conversation
         self._conversation = None
         self._started = False
+        self._prepared = False
         if conv is None:
             return
         try:
@@ -296,43 +531,43 @@ class ElevenAgentBridge:
         except Exception:  # noqa: BLE001
             logger.debug("wait_for_session_end raised", exc_info=True)
 
-    async def _park_conversation(self) -> None:
-        """Stop ConvAI so it can't fill silence with 'are you still there?'."""
-        self._room.set_user_audio_sink(None)
-        # Mute agent TTS immediately so late Mentor chunks can't talk over us.
-        self._audio.stop()
+    # ---- Grok → caller ----
+    def on_fix_done(self, summary: str, applied: bool = True) -> str:
+        """Called by the fix_done MCP tool (event loop). Returns delivery mode."""
+        result = (
+            f"Grok finished. Applied: {'yes' if applied else 'no'}. {summary.strip()}"
+        )
+        fut = self._fix_future
+        if fut is not None and not fut.done():
+            fut.set_result(result)
+            return "tool_result"
+        # Nobody waiting (tool already timed out): push as context so the agent
+        # mentions it on its next turn.
         conv = self._conversation
-        self._conversation = None
-        self._started = False
-        if conv is None:
-            return
-        try:
-            await asyncio.to_thread(conv.end_session)
-        except Exception:  # noqa: BLE001
-            logger.debug("park end_session", exc_info=True)
-        try:
-            await asyncio.to_thread(conv.wait_for_session_end)
-        except Exception:  # noqa: BLE001
-            logger.debug("park wait_for_session_end", exc_info=True)
+        if conv is not None:
+            try:
+                conv.send_contextual_update(
+                    f"UPDATE: {result} Tell the caller about this on your next turn."
+                )
+                return "contextual_update"
+            except Exception:  # noqa: BLE001
+                logger.exception("contextual update for fix_done failed")
+        return "dropped"
 
-    async def _thinking_filler_then_park(self) -> None:
-        """Human-sounding cover while Grok edits; then mute ConvAI."""
-        # Cut Mentor immediately so it can't ask "are you still there?" over us.
-        self._audio.mute_agent_output()
-        line = "Okay… on it. Give me a second while I apply that."
+    async def _handle_agent_ended(self) -> None:
+        """Agent hung up (end_call): let the goodbye finish playing, then end the call."""
+        logger.info("Mentor ended the conversation; waiting for goodbye audio to drain")
+        deadline = time.monotonic() + 10.0
+        while self._room.agent_speaking() and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        from escalation_mcp.session import hangup_from_agent
+
         try:
-            from escalation_mcp.voice.tts import synthesize_pcm48
-
-            pcm = await asyncio.to_thread(synthesize_pcm48, line)
-            self._room.clear_audio_queue()
-            self._room.play_pcm(pcm)
-            # Let most of the line play before tearing down the agent socket.
-            await asyncio.sleep(min(3.5, max(1.2, len(pcm) / (48000 * 2) * 0.85)))
+            await hangup_from_agent(self._packet.incident_id, reason="agent_end_call")
         except Exception:  # noqa: BLE001
-            logger.exception("thinking filler TTS failed")
-        await self._park_conversation()
-        logger.info("Mentor ConvAI parked after approve (TTS owns the rest of the call)")
+            logger.exception("hangup after agent end_call failed")
 
+    # ---- caller → Grok ----
     async def _send_to_grok(self, parameters: dict) -> str:
         raw = str(parameters.get("decision") or "").strip().lower()
         text = parameters.get("text")
@@ -351,26 +586,44 @@ class ElevenAgentBridge:
                 "from": "facetime-mentor",
             }
         )
-        await STATE.enqueue_decision(decision)
-        logger.info(
-            "send_to_grok → %s (%s)",
-            decision.decision,
-            (decision.text or "")[:80],
-        )
-        if decision.decision == "approve":
-            # Cover the edit gap + stop ConvAI idle prompts.
-            asyncio.create_task(
-                self._thinking_filler_then_park(), name="mentor-thinking-park"
+
+        wants_change = decision.decision in ("approve", "instruction")
+        pending = self._fix_future is not None and not self._fix_future.done()
+        if decision.decision == "approve" and pending:
+            # Agent re-sent approve while Grok is still working (e.g. after a
+            # tool timeout). Don't queue a duplicate edit; wait on the same one.
+            logger.info("send_to_grok → approve (duplicate while Grok is working; not re-queued)")
+        else:
+            if wants_change and not pending:
+                self._fix_future = self._loop.create_future()
+            await STATE.enqueue_decision(decision)
+            logger.info(
+                "send_to_grok → %s (%s)", decision.decision, (decision.text or "")[:80]
             )
-            return (
-                "queued decision=approve. "
-                "Say NOTHING else. Do not ask if the user is still there. Stay silent."
-            )
-        if decision.decision in ("reject", "stop"):
-            asyncio.create_task(self._park_conversation(), name="mentor-park")
-            return (
-                f"queued decision={decision.decision}. "
-                "Say NOTHING else. Stay silent."
-            )
+
         # ElevenLabs client_tool_result.result must be a string (dict → 1008 close).
-        return f"queued decision={decision.decision}"
+        if decision.decision == "reject":
+            return (
+                "Recorded: no changes will be made. Acknowledge briefly and ask if "
+                "there's anything else."
+            )
+        if decision.decision == "stop":
+            return "Recorded: Grok is stopping and reverting. Confirm briefly."
+
+        fut = self._fix_future
+        assert fut is not None
+        try:
+            result = await asyncio.wait_for(asyncio.shield(fut), timeout=FIX_WAIT_S)
+        except asyncio.TimeoutError:
+            logger.warning("send_to_grok: no fix_done after %.0fs", FIX_WAIT_S)
+            return (
+                "Grok is still applying the change. Tell the caller it's taking a few "
+                "more seconds; you'll get an update."
+            )
+        except asyncio.CancelledError:
+            return "The call is ending."
+        logger.info("send_to_grok result → %s", result[:160])
+        return (
+            f"{result} Now tell the caller what changed and why in one or two "
+            "sentences, what they should see next, then ask if there's anything else."
+        )

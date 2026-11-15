@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import TYPE_CHECKING, Any
 
 from escalation_mcp.screen.backends.base import ScreenBackend
@@ -62,8 +63,15 @@ class LiveKitScreenBackend(ScreenBackend):
         self._source = rtc.VideoSource(W, H)
         self._track = rtc.LocalVideoTrack.create_video_track("agent-video", self._source)
         options = rtc.TrackPublishOptions()
-        # Screenshare source matches the product and can keyframe more eagerly.
-        options.source = rtc.TrackSource.SOURCE_SCREENSHARE
+        # Chert's bridge has historically ignored screenshare-source tracks
+        # (black video); camera source is the known-good default. Override with
+        # AGENT_VIDEO_SOURCE=screenshare to A/B test.
+        source_name = (os.getenv("AGENT_VIDEO_SOURCE") or "camera").strip().lower()
+        options.source = (
+            rtc.TrackSource.SOURCE_SCREENSHARE
+            if source_name == "screenshare"
+            else rtc.TrackSource.SOURCE_CAMERA
+        )
         options.video_codec = rtc.VideoCodec.H264
         options.simulcast = False
         self._publication = await self._room_conn.room.local_participant.publish_track(
@@ -71,7 +79,9 @@ class LiveKitScreenBackend(ScreenBackend):
         )
         self._stop.clear()
         self._task = asyncio.create_task(self._push_frames(), name="lk-screen-push")
-        logger.info("published agent screenshare track %sx%s (H.264)", W, H)
+        logger.info(
+            "published agent video track %sx%s (H.264, source=%s)", W, H, source_name
+        )
 
     async def _push_one_frame(self) -> None:
         import numpy as np
