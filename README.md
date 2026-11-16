@@ -82,4 +82,4 @@ A training run with a learning rate that's too high goes NaN, your phone rings, 
 
 ## Team
 
-Built at HackUTA 2026 by Binoy, Ming, Febri and Ron.
+Built at HackUTA 2026 by Binoy, Allen, Febri and Ron.
